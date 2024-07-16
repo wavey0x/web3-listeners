@@ -1,0 +1,4 @@
+psycopg2
+python-doten
+SQLAlchemy
+web3
