@@ -20,7 +20,7 @@ load_dotenv()
 # Connection URL to your Ethereum node
 WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
-POLL_INTERVAL = 10
+POLL_INTERVAL = 120
 
 # Connect to Ethereum network
 w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
@@ -39,11 +39,6 @@ yvycrv_abi = utils.load_abi('./abis/yvycrv.json')
 asdcrv_abi = utils.load_abi('./abis/asdcrv.json')
 ucvxcrv_abi = utils.load_abi('./abis/ucvxcrv.json')
 
-event_filters = {
-    'Harvested': [],
-    # etc ...
-}
-
 def get_last_block_written(contract):
 
     # Connecting to the database and fetching the last block
@@ -57,22 +52,42 @@ def get_last_block_written(contract):
 
 
 def main():
-    for compounder, info in CURVE_LIQUID_LOCKER_COMPOUNDERS.items():
-        last_block_written = get_last_block_written(compounder)
-        print(f'{info["symbol"]} listening from block: {last_block_written}')
-        event_filters['Harvested'].append(create_filter(compounder, info, last_block_written))
-
-    log_loop(event_filters, POLL_INTERVAL)
-
-def log_loop(event_filters, poll_interval):
+    i = 0
     while True:
-        for type, filters in event_filters.items():
-            if type == 'Harvested':
-                for filter in filters:
-                    address = filter.filter_params.get('address')
-                    for event in filter.get_new_entries():
-                        handle_harvested_event(address, event)
-        time.sleep(poll_interval)
+        i += 1
+        if i % 100 == 0: print(f"Loops since startup: {i}")
+        height = w3.eth.get_block_number()
+        for compounder, info in CURVE_LIQUID_LOCKER_COMPOUNDERS.items():
+            last_block_written = get_last_block_written(compounder)
+            print(f'{info["symbol"]} listening from block: {last_block_written}')
+
+            abi, event_name = get_abi_and_event_name(info)
+            contract = w3.eth.contract(address=compounder, abi=abi)
+            event = getattr(contract.events, event_name)
+
+            logs = fetch_logs(contract, event_name, last_block_written, height)
+            for log in logs:
+                handle_harvested_event(compounder, log)
+    
+        time.sleep(POLL_INTERVAL)
+
+def fetch_logs(contract, event_name, from_block, to_block):
+    event = getattr(contract.events, event_name)
+    logs = event.get_logs(
+        fromBlock=from_block,
+        toBlock=to_block
+    )
+    return logs
+
+def get_abi_and_event_name(info):
+    abi = ucvxcrv_abi
+    event_name = 'Harvest'
+    if info['symbol'] == 'asdCRV':
+        abi = asdcrv_abi
+    if info['symbol'] == 'yvyCRV':
+        abi = yvycrv_abi
+        event_name = 'StrategyReported'
+    return abi, event_name
 
 def handle_harvested_event(address, event):
     profit = 0
