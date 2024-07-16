@@ -3,8 +3,12 @@ from sqlalchemy import create_engine, Table, Column, Integer, String, MetaData, 
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from psycopg2 import errors
-import time, os, json
+import time, os, json, sys
 from datetime import datetime
+# Add the parent directory of the current file to sys.path
+parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+sys.path.append(parent_dir)
+
 import utils
 from dotenv import load_dotenv
 
