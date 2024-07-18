@@ -17,7 +17,7 @@ load_dotenv()
 # Connection URL to your Ethereum node
 WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
-DEPLOY_BLOCK=19919001
+DEPLOY_BLOCK=19888353
 MAX_WIDTH = 200_000
 POLL_INTERVAL = 120 # seconds
 
@@ -205,7 +205,6 @@ def log_loop():
             print(f'{deployments[token]["symbol"]} RewardsClaimed listening from block {last_block_reward_claim}')
             print('----')
 
-            height = w3.eth.get_block_number()
             staked_logs = fetch_logs(
                 ybs_contract, 
                 'Staked', 
