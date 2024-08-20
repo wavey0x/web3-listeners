@@ -65,7 +65,9 @@ GAUGE_NAME_EXCEPTIONS = {
     '0x75D05190f35567e79012c2F0a02330D3Ed8a1F74': 'avax btcCRV',
     '0xa05E565cA0a103FcD999c7A7b8de7Bd15D5f6505': 'avax 3crypto',
     '0xf2Cde8c47C20aCbffC598217Ad5FE6DB9E00b163': 'harmony gauge',
-    '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH'
+    '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH',
+    '0xbAF05d7aa4129CA14eC45cC9d4103a9aB9A9fF60': 'Vyper Fundraising Gauge',
+    
 }
 
 def main():
