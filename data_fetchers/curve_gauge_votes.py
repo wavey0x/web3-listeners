@@ -21,7 +21,7 @@ VE_ADDRESS = '0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2'
 WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
 DEPLOY_BLOCK=10647875
-MAX_WIDTH = 200_000
+MAX_WIDTH = 250_000
 POLL_INTERVAL = 1 # seconds
 
 # Connect to Ethereum network
@@ -67,7 +67,7 @@ GAUGE_NAME_EXCEPTIONS = {
     '0xf2Cde8c47C20aCbffC598217Ad5FE6DB9E00b163': 'harmony gauge',
     '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH',
     '0xbAF05d7aa4129CA14eC45cC9d4103a9aB9A9fF60': 'Vyper Fundraising Gauge',
-    
+
 }
 
 def main():
@@ -140,7 +140,7 @@ def log_loop():
             gauge_controller_contract, 
             'VoteForGauge', 
             last_block_written, 
-            min(last_block_written + 100_000, height)
+            min(last_block_written + MAX_WIDTH, height)
         )
 
         for log in logs:
