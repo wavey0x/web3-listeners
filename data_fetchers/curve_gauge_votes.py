@@ -47,6 +47,25 @@ gauge_name_dict = {}
 gauge_controller_contract = w3.eth.contract(address=GAUGE_CONTROLLER_ADDRESS, abi=gauge_controller_abi)
 ve_contract = w3.eth.contract(address=VE_ADDRESS, abi=ve_abi)
 
+GAUGE_NAME_EXCEPTIONS = {
+    '0x6C09F6727113543Fd061a721da512B7eFCDD0267': 'xdai x3pool',
+    '0xb9C05B8EE41FDCbd9956114B3aF15834FDEDCb54': 'ftm 2pool',
+    '0xfE1A3dD8b169fB5BF0D5dbFe813d956F39fF6310': 'ftm g3CRV',
+    '0xfDb129ea4b6f557b07BcDCedE54F665b7b6Bc281': 'ftm btcCRV',
+    '0x260e4fBb13DD91e187AE992c3435D0cf97172316': 'ftm crv3crypto',
+    '0xC48f4653dd6a9509De44c92beb0604BEA3AEe714': 'polygon am3pool',
+    '0x060e386eCfBacf42Aa72171Af9EFe17b3993fC4F': 'polygon a3crypto',
+    '0x488E6ef919C2bB9de535C634a80afb0114DA8F62': 'polygon btcCRV',
+    '0xAF78381216a8eCC7Ad5957f3cD12a431500E0B0D': 'polygon crvEURTUSD',
+    '0xFf17560d746F85674FE7629cE986E949602EF948': 'arbi 2pool',
+    '0x9F86c5142369B1Ffd4223E5A2F2005FC66807894': 'arbi btcCRV',
+    '0x9044E12fB1732f88ed0c93cfa5E9bB9bD2990cE5': 'arbi 3crypto',
+    '0x56eda719d82aE45cBB87B7030D3FB485685Bea45': 'arbi crvEURSUSD',
+    '0xB504b6EB06760019801a91B451d3f7BD9f027fC9': 'avax av3crv',
+    '0x75D05190f35567e79012c2F0a02330D3Ed8a1F74': 'avax btcCRV',
+    '0xa05e565ca0a103fcd999c7a7b8de7bd15d5f6505': 'avax 3crypto'
+}
+
 def main():
     global gauge_name_dict
     gauge_name_dict = get_gauge_list()
@@ -64,7 +83,14 @@ def handle_vote_event(event):
     weight = event['args']['weight']
     user = event['args']['user']
     amount = ve_contract.functions.balanceOf(user).call(block_identifier=block) / 1e18 * weight / 10_000
-    gauge_name = gauge_name_dict[gauge]
+    if gauge in gauge_name_dict:
+        gauge_name = gauge_name_dict[gauge]
+    elif gauge in GAUGE_NAME_EXCEPTIONS:
+        gauge_name = GAUGE_NAME_EXCEPTIONS[gauge]
+    else:
+        print(gauge)
+        raise Exception("GAUGE NAME NOT FOUND!")
+
     try:
         ins = table.insert().values(
             gauge=gauge,
