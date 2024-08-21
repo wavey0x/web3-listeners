@@ -93,6 +93,7 @@ def handle_vote_event(event):
     gauge = event['args']['gauge_addr']
     weight = event['args']['weight']
     user = event['args']['user']
+    alias = '' if user not in ALIASES else ALIASES[user]
     amount = ve_contract.functions.balanceOf(user).call(block_identifier=block) / 1e18 * weight / 10_000
     if gauge in gauge_name_dict:
         gauge_name = gauge_name_dict[gauge]
@@ -109,7 +110,7 @@ def handle_vote_event(event):
             account=user,
             amount=amount,
             weight=weight,
-            account_alias='' if user not in ALIASES else ALIASES[user]
+            account_alias=alias,
             txn_hash = txn_hash,
             timestamp = timestamp,
             date_str = date_str,
