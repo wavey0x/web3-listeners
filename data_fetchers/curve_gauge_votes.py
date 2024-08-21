@@ -4,14 +4,18 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from psycopg2 import errors
 import time, os, json, sys
+import telebot
 from datetime import datetime
+import utils
+from dotenv import load_dotenv
+from constants import CHAT_IDS
+
 # Add the parent directory of the current file to sys.path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
 
-import utils
-from dotenv import load_dotenv
-
+telegram_bot_key = os.environ.get('WAVEY_ALERTS_BOT_KEY')
+bot = telebot.TeleBot(telegram_bot_key)
 load_dotenv()
 
 GAUGE_CONTROLLER_ADDRESS = '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
@@ -23,6 +27,8 @@ DATABASE_URI = os.getenv('DATABASE_URI')
 DEPLOY_BLOCK=10647875
 MAX_WIDTH = 250_000
 POLL_INTERVAL = 10 # seconds
+
+last_block_alerted = 0
 
 # Connect to Ethereum network
 w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
@@ -84,6 +90,7 @@ def main():
     log_loop()
 
 def handle_vote_event(event):
+    global last_block_alerted
     # Parse the event data and write to the database
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
@@ -127,6 +134,18 @@ def handle_vote_event(event):
         print("Database error occurred:", e)
     except Exception as e:
         print("An error occurred:", e)
+
+    if (
+        amount > 1_000_000
+        and user in ALIASES 
+        and block > last_block_alerted
+    ):
+        last_block_alerted = block
+        alias = ALIASES[user]
+        m = f'🗳️ Curve Gauge Vote Detected'
+        m += f'\n\n {alias}'
+        m += f'\n\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})'
+        send_alert(CHAT_IDS['WAVEY_ALERTS'], m)
 
 def fetch_logs(contract, event_name, from_block, to_block):
     event = getattr(contract.events, event_name)
@@ -176,6 +195,10 @@ def get_gauge_list():
         gauge_name = re.sub(r'\s*\(.*?\)', '', gauge_name)
         gauge_list[w3.to_checksum_address(d['gauge'])] = gauge_name
     return gauge_list
+
+
+def send_alert(chat_id, msg):
+    bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview = True)
 
 
 if __name__ == '__main__':
