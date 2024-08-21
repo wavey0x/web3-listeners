@@ -22,7 +22,7 @@ WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
 DEPLOY_BLOCK=10647875
 MAX_WIDTH = 250_000
-POLL_INTERVAL = 1 # seconds
+POLL_INTERVAL = 10 # seconds
 
 # Connect to Ethereum network
 w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
@@ -68,10 +68,6 @@ GAUGE_NAME_EXCEPTIONS = {
     '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH',
     '0xbAF05d7aa4129CA14eC45cC9d4103a9aB9A9fF60': 'Vyper Fundraising Gauge',
 }
-
-UPDATE curve_gauge_votes
-SET account_alias = 'Mich'
-WHERE account = '0x7a16fF8270133F063aAb6C9977183D9e72835428';
 
 
 ALIASES = {
