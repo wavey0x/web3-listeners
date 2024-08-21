@@ -67,7 +67,18 @@ GAUGE_NAME_EXCEPTIONS = {
     '0xf2Cde8c47C20aCbffC598217Ad5FE6DB9E00b163': 'harmony gauge',
     '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH',
     '0xbAF05d7aa4129CA14eC45cC9d4103a9aB9A9fF60': 'Vyper Fundraising Gauge',
+}
 
+UPDATE curve_gauge_votes
+SET account_alias = 'Mich'
+WHERE account = '0x7a16fF8270133F063aAb6C9977183D9e72835428';
+
+
+ALIASES = {
+    '0x989AEb4d175e16225E39E87d0D97A3360524AD80': 'Convex',
+    '0x7a16fF8270133F063aAb6C9977183D9e72835428': 'Mich',
+    '0xF147b8125d2ef93FB6965Db97D6746952a133934': 'Yearn',
+    '0x52f541764E6e90eeBc5c21Ff570De0e2D63766B6': 'Stakedao',
 }
 
 def main():
@@ -102,6 +113,7 @@ def handle_vote_event(event):
             account=user,
             amount=amount,
             weight=weight,
+            account_alias='' if user not in ALIASES else ALIASES[user]
             txn_hash = txn_hash,
             timestamp = timestamp,
             date_str = date_str,
