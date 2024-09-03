@@ -108,8 +108,7 @@ def handle_vote_event(event):
     elif gauge in GAUGE_NAME_EXCEPTIONS:
         gauge_name = GAUGE_NAME_EXCEPTIONS[gauge]
     else:
-        print(gauge)
-        raise Exception("GAUGE NAME NOT FOUND!")
+        raise Exception(f"GAUGE NAME NOT FOUND! {gauge}")
 
     try:
         ins = table.insert().values(
@@ -165,7 +164,6 @@ def log_loop():
 
         print(f'Listening from block {last_block_written}')
         to_block = min(last_block_written + MAX_WIDTH, height)
-        print(last_block_written, to_block)
         logs = fetch_logs(
             gauge_controller_contract, 
             'VoteForGauge', 
