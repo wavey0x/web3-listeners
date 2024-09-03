@@ -127,13 +127,13 @@ def handle_vote_event(event):
         conn.execute(ins)
         conn.commit()
         # conn.close()
-        print(f'{gauge} {gauge_name} vote worth {amount:,.0f} veCRV written successfully | Block: {block} Txn: {txn_hash}')
+        print(f'{gauge} {gauge_name} vote worth {amount:,.0f} veCRV written successfully | Block: {block} Txn: {txn_hash}', flush=True)
     except IntegrityError as e:
         conn.rollback()
     except SQLAlchemyError as e:
-        print("Database error occurred:", e)
+        print("Database error occurred:", e, flush=True)
     except Exception as e:
-        print("An error occurred:", e)
+        print("An error occurred:", e, flush=True)
 
     if (
         amount > 1_000_000
@@ -159,7 +159,7 @@ def log_loop():
     i = 0
     while True:
         i += 1
-        if i % 100 == 0: print(f"Loops since startup: {i}")
+        if i % 100 == 0: print(f"Loops since startup: {i}", flush=True)
         last_block_written = get_last_block_written()
 
         print(f'Listening from block {last_block_written}', flush=True)
