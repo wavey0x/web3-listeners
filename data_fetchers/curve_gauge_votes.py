@@ -6,13 +6,14 @@ from psycopg2 import errors
 import time, os, json, sys
 import telebot
 from datetime import datetime
-import utils
 from dotenv import load_dotenv
-from constants import CHAT_IDS
 
 # Add the parent directory of the current file to sys.path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
+import utils
+from constants import CHAT_IDS
+
 
 telegram_bot_key = os.environ.get('WAVEY_ALERTS_BOT_KEY')
 bot = telebot.TeleBot(telegram_bot_key)
@@ -163,12 +164,13 @@ def log_loop():
         last_block_written = get_last_block_written()
 
         print(f'Listening from block {last_block_written}')
-
+        to_block = min(last_block_written + MAX_WIDTH, height)
+        print(last_block_written, to_block)
         logs = fetch_logs(
             gauge_controller_contract, 
             'VoteForGauge', 
             last_block_written, 
-            min(last_block_written + MAX_WIDTH, height)
+            to_block
         )
 
         for log in logs:
