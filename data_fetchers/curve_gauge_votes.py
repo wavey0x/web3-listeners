@@ -162,7 +162,7 @@ def log_loop():
         if i % 100 == 0: print(f"Loops since startup: {i}")
         last_block_written = get_last_block_written()
 
-        print(f'Listening from block {last_block_written}')
+        print(f'Listening from block {last_block_written}', flush=True)
         to_block = min(last_block_written + MAX_WIDTH, height)
         logs = fetch_logs(
             gauge_controller_contract, 
