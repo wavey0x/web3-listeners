@@ -48,8 +48,6 @@ table = Table('curve_gauge_votes', metadata, autoload_with=engine)
 gauge_controller_abi = utils.load_abi('./abis/gauge_controller.json')
 ve_abi = utils.load_abi('./abis/ve.json')
 
-height = w3.eth.get_block_number()
-
 gauge_name_dict = {}
 gauge_controller_contract = w3.eth.contract(address=GAUGE_CONTROLLER_ADDRESS, abi=gauge_controller_abi)
 ve_contract = w3.eth.contract(address=VE_ADDRESS, abi=ve_abi)
@@ -160,8 +158,8 @@ def log_loop():
     while True:
         i += 1
         if i % 100 == 0: print(f"Loops since startup: {i}", flush=True)
+        height = w3.eth.get_block_number()
         last_block_written = get_last_block_written()
-
         print(f'Listening from block {last_block_written}', flush=True)
         to_block = min(last_block_written + MAX_WIDTH, height)
         logs = fetch_logs(
@@ -170,7 +168,7 @@ def log_loop():
             last_block_written, 
             to_block
         )
-
+        
         for log in logs:
             handle_vote_event(log)
 
