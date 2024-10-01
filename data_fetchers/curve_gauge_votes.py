@@ -143,7 +143,7 @@ def handle_vote_event(event):
         m = f'🗳️ Curve Gauge Vote Detected'
         m += f'\n\n {alias}'
         m += f'\n\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})'
-        send_alert(CHAT_IDS['WAVEY_ALERTS'], m)
+        send_alert(CHAT_IDS['YLOCKERS'], m)
 
 def fetch_logs(contract, event_name, from_block, to_block):
     event = getattr(contract.events, event_name)
