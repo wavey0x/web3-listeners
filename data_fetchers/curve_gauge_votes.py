@@ -72,6 +72,7 @@ GAUGE_NAME_EXCEPTIONS = {
     '0xf2Cde8c47C20aCbffC598217Ad5FE6DB9E00b163': 'harmony gauge',
     '0x1cEBdB0856dd985fAe9b8fEa2262469360B8a3a6': 'crvCRVETH',
     '0xbAF05d7aa4129CA14eC45cC9d4103a9aB9A9fF60': 'Vyper Fundraising Gauge',
+    '0x44e528e6a1aa1A931946fa96753F7dDc8d61B489': 'scrvUSD/USDC',
 }
 
 
