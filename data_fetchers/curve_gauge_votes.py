@@ -76,6 +76,7 @@ GAUGE_NAME_EXCEPTIONS = {
     '0x12C3F630ec8f8A07C539b5F933e8E62F9b627396': 'insfrxETH/sfrxETH',
     '0xa971354DB30DF69b35cf99B434875A32AEA0718A': 'CrossCurve Stable on Fantom',
     '0x170100AeD2A922a570E5D105C29cc7158f3de359': 'CrossCurve ETH on Fantom',
+    '0x8596721b74d92196E19c5Cb57cf7A46ADbf2b32a': 'CrossCurve 2 on Fantom',
     
 }
 
