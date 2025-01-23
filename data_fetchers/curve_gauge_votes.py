@@ -199,7 +199,10 @@ def get_gauge_list():
     gauge_list = {}
     for gauge_name, d in data.items():
         gauge_name = re.sub(r'\s*\(.*?\)', '', gauge_name)
-        gauge_list[w3.to_checksum_address(d['gauge'])] = gauge_name
+        if 'rootGauge' in d:
+            gauge_list[w3.to_checksum_address(d['rootGauge'])] = gauge_name
+        else:
+            gauge_list[w3.to_checksum_address(d['gauge'])] = gauge_name
     return gauge_list
 
 
