@@ -239,10 +239,10 @@ def handle_vote_cast(event, voter_address):
             msg += f"Voter: {format_address(voter)}\n"
             if weight_yes > 0:
                 msg += f"Vote: Yes\n"
-                msg += f"Weight: {weight_yes:,}\n"
+                msg += f"Weight: {weight_yes:,.0f}\n"
             else:
                 msg += f"Vote: No\n"
-                msg += f"Weight: {weight_no:,}\n"
+                msg += f"Weight: {weight_no:,.0f}\n"
             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
             # send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
             
