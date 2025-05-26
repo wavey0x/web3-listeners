@@ -566,21 +566,16 @@ def main():
     i = 0
     while True:
         try:
-            i += 1
-            if i % 100 == 0:
-                logger.info(f"Loops since startup: {i}")
-            
+            i += 1            
             height = w3.eth.get_block_number()
             last_block_written = get_last_block_written()
-            logger.info(f'\nCurrent block height: {height}')
-            logger.info(f'Listening from block {last_block_written}')
-            
             to_block = min(last_block_written + MAX_WIDTH, height)
-            logger.info(f'Will scan to block {to_block}')
+            if i % 100 == 0:
+                logger.info(f"Loops since startup: {i}")
+                logger.info(f'Listening from block {last_block_written} --> {to_block}')
             
             # Process events for each voter contract
             for voter_address, contract in voter_contracts.items():
-                logger.info(f"\nProcessing events for voter: {voter_address}")
                 try:
                     # ProposalCreated
                     logs = fetch_logs(contract, 'ProposalCreated', last_block_written, to_block)
