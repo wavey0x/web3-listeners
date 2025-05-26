@@ -98,7 +98,9 @@ def main():
 
 def handle_vote_event(event):
     global last_block_alerted
+    # Initialize gauge_name at the start to ensure it always has a value
     gauge_name = 'Unknown Gauge Name'
+    
     # Parse the event data and write to the database
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
@@ -115,6 +117,7 @@ def handle_vote_event(event):
     elif gauge in GAUGE_NAME_EXCEPTIONS:
         gauge_name = GAUGE_NAME_EXCEPTIONS[gauge]
     else:
+        gauge_name = 'Unknown Gauge Name'
         send_alert(CHAT_IDS['WAVEY_ALERTS'], f"New Curve vote for a gauge that doesn't have a name!\n{gauge}")
 
     try:
