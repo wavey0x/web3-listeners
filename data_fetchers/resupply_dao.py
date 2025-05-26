@@ -3,8 +3,7 @@ from sqlalchemy import create_engine, MetaData, select, and_
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import time
-import json
-from datetime import datetime, timedelta, UTC
+from datetime import datetime, UTC
 import sys
 import os
 import telebot
@@ -40,7 +39,10 @@ EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
 MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
 INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
 VOTING_PERIOD = 60 * 60 * 24 * 7  # 1 week
-
+PERMASTAKERS = [
+    '0x12341234B35c8a48908c716266db79CAeA0100E8',
+    '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901',
+]
 # Known voter addresses
 VOTER_ADDRESSES = [
     '0x11111111084a560ea5755Ed904a57e5411888C28',
@@ -244,7 +246,8 @@ def handle_vote_cast(event, voter_address):
                 msg += f"Vote: No\n"
                 msg += f"Weight: {weight_no:,.0f}\n"
             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
-            # send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+            if voter in PERMASTAKERS:
+                send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
             
     except IntegrityError as e:
         logger.error(f"Integrity error in handle_vote_cast: {str(e)}")
