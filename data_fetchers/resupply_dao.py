@@ -402,9 +402,9 @@ def check_proposal_statuses():
                         msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                         msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"Current Yes Votes: {proposal.yes_votes:,.0}\n"
-                        msg += f"Current No Votes: {proposal.no_votes:,.0}\n"
-                        msg += f"Quorum: {proposal.quorum:,.0}\n"
+                        msg += f"Current Yes Votes: {proposal.yes_votes:,.0f}\n"
+                        msg += f"Current No Votes: {proposal.no_votes:,.0f}\n"
+                        msg += f"Quorum: {proposal.quorum:,.0f}\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                     
@@ -428,8 +428,8 @@ def check_proposal_statuses():
                             
                             msg = f"🚀 *Resupply Proposal Passed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                            msg += f"Yes Votes: {proposal.yes_votes:,.0}\n"
-                            msg += f"No Votes: {proposal.no_votes:,.0}\n"
+                            msg += f"Yes Votes: {proposal.yes_votes:,.0f}\n"
+                            msg += f"No Votes: {proposal.no_votes:,.0f}\n"
                             msg += f"Executable in 24hrs"
                             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
@@ -451,9 +451,9 @@ def check_proposal_statuses():
                             
                             msg = f"❌ *Resupply Proposal Failed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                            msg += f"Yes Votes: {proposal.yes_votes:,.0}\n"
-                            msg += f"No Votes: {proposal.no_votes:,.0}\n"
-                            msg += f"Quorum: {proposal.quorum:,.0}\n"
+                            msg += f"Yes Votes: {proposal.yes_votes:,.0f}\n"
+                            msg += f"No Votes: {proposal.no_votes:,.0f}\n"
+                            msg += f"Quorum: {proposal.quorum:,.0f}\n"
                             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
