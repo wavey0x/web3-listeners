@@ -10,6 +10,15 @@ import os
 import telebot
 from telebot.apihelper import ApiException
 from dotenv import load_dotenv
+import logging
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S'
+)
+logger = logging.getLogger(__name__)
 
 # Add the parent directory of the current file to sys.path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
@@ -84,7 +93,7 @@ def get_last_block_written():
             
             return highest_block + 1
     except SQLAlchemyError as e:
-        print(f"Database error in get_last_block_written: {str(e)}")
+        logger.error(f"Database error in get_last_block_written: {str(e)}")
         raise  # Re-raise to prevent silent failures
 
 def send_alert(chat_id, msg):
@@ -99,23 +108,23 @@ def send_alert(chat_id, msg):
         except ApiException as e:
             if e.error_code == 429:  # Rate limit error
                 retry_after = int(e.description.split('retry after ')[-1])
-                print(f"Telegram rate limit hit. Waiting {retry_after} seconds...")
+                logger.warning(f"Telegram rate limit hit. Waiting {retry_after} seconds...")
                 time.sleep(retry_after)
                 retry_count += 1
             else:
-                print(f"Telegram API error: {str(e)}")
+                logger.error(f"Telegram API error: {str(e)}")
                 time.sleep(retry_delay)
                 retry_delay *= 2  # Exponential backoff
                 retry_count += 1
         except Exception as e:
-            print(f"Unexpected error sending Telegram message: {str(e)}")
+            logger.error(f"Unexpected error sending Telegram message: {str(e)}")
             time.sleep(retry_delay)
             retry_delay *= 2  # Exponential backoff
             retry_count += 1
     
     if retry_count >= MAX_TELEGRAM_RETRIES:
-        print(f"Failed to send Telegram message after {MAX_TELEGRAM_RETRIES} retries")
-        print(f"Message was: {msg}")
+        logger.error(f"Failed to send Telegram message after {MAX_TELEGRAM_RETRIES} retries")
+        logger.error(f"Message was: {msg}")
 
 def handle_proposal_created(event, voter_address):
     block = event.blockNumber
@@ -162,13 +171,13 @@ def handle_proposal_created(event, voter_address):
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except IntegrityError as e:
-        print(f"Integrity error in handle_proposal_created: {str(e)}")
+        logger.error(f"Integrity error in handle_proposal_created: {str(e)}")
         raise
     except SQLAlchemyError as e:
-        print(f"Database error in handle_proposal_created: {str(e)}")
+        logger.error(f"Database error in handle_proposal_created: {str(e)}")
         raise
     except Exception as e:
-        print(f"Unexpected error in handle_proposal_created: {str(e)}")
+        logger.error(f"Unexpected error in handle_proposal_created: {str(e)}")
         raise
 
 def get_proposal_description(proposal_id, voter_address):
@@ -220,7 +229,7 @@ def handle_vote_cast(event, voter_address):
             
             result = conn.execute(update)
             if result.rowcount == 0:
-                print(f"Warning: No proposal found to update for proposal_id {proposal_id} and voter {voter_address}")
+                logger.warning(f"No proposal found to update for proposal_id {proposal_id} and voter {voter_address}")
             
             conn.commit()
             
@@ -238,13 +247,13 @@ def handle_vote_cast(event, voter_address):
             # send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
             
     except IntegrityError as e:
-        print(f"Integrity error in handle_vote_cast: {str(e)}")
+        logger.error(f"Integrity error in handle_vote_cast: {str(e)}")
         raise
     except SQLAlchemyError as e:
-        print(f"Database error in handle_vote_cast: {str(e)}")
+        logger.error(f"Database error in handle_vote_cast: {str(e)}")
         raise
     except Exception as e:
-        print(f"Unexpected error in handle_vote_cast: {str(e)}")
+        logger.error(f"Unexpected error in handle_vote_cast: {str(e)}")
         raise
 
 def handle_proposal_cancelled(event, voter_address):
@@ -282,10 +291,10 @@ def handle_proposal_cancelled(event, voter_address):
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
-        print(f"Database error in handle_proposal_cancelled: {str(e)}")
+        logger.error(f"Database error in handle_proposal_cancelled: {str(e)}")
         raise
     except Exception as e:
-        print(f"Unexpected error in handle_proposal_cancelled: {str(e)}")
+        logger.error(f"Unexpected error in handle_proposal_cancelled: {str(e)}")
         raise
 
 def handle_proposal_executed(event, voter_address):
@@ -325,10 +334,10 @@ def handle_proposal_executed(event, voter_address):
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
-        print(f"Database error in handle_proposal_executed: {str(e)}")
+        logger.error(f"Database error in handle_proposal_executed: {str(e)}")
         raise
     except Exception as e:
-        print(f"Unexpected error in handle_proposal_executed: {str(e)}")
+        logger.error(f"Unexpected error in handle_proposal_executed: {str(e)}")
         raise
 
 def handle_proposal_description_updated(event, voter_address):
@@ -367,9 +376,9 @@ def handle_proposal_description_updated(event, voter_address):
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
-        print("Database error occurred:", e)
+        logger.error("Database error occurred:", exc_info=True)
     except Exception as e:
-        print("An error occurred:", e)
+        logger.error("An error occurred:", exc_info=True)
 
 def check_proposal_statuses():
     current_time = int(time.time())
@@ -414,7 +423,7 @@ def check_proposal_statuses():
                             )
                             result = conn.execute(update)
                             if result.rowcount == 0:
-                                print(f"Warning: Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
+                                logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
                             conn.commit()
                             
                             msg = f"🚀 *Resupply Proposal Passed*\n\n"
@@ -437,7 +446,7 @@ def check_proposal_statuses():
                             )
                             result = conn.execute(update)
                             if result.rowcount == 0:
-                                print(f"Warning: Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
+                                logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
                             conn.commit()
                             
                             msg = f"❌ *Resupply Proposal Failed*\n\n"
@@ -505,10 +514,10 @@ def check_proposal_statuses():
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
     
     except SQLAlchemyError as e:
-        print(f"Database error in check_proposal_statuses: {str(e)}")
+        logger.error(f"Database error in check_proposal_statuses: {str(e)}")
         raise
     except Exception as e:
-        print(f"Unexpected error in check_proposal_statuses: {str(e)}")
+        logger.error(f"Unexpected error in check_proposal_statuses: {str(e)}")
         raise
 
 def get_registry_voter():
@@ -527,7 +536,7 @@ def fetch_logs(contract, event_name, from_block, to_block):
         )
         return logs
     except Exception as e:
-        print(f"Error fetching logs for {event_name}: {str(e)}")
+        logger.error(f"Error fetching logs for {event_name}: {str(e)}")
         raise
 
 def main():
@@ -538,12 +547,12 @@ def main():
         if registry_voter != '0x0000000000000000000000000000000000000000':
             voter_addresses.add(registry_voter)
     except Exception as e:
-        print(f"Error getting registry voter: {str(e)}")
-        print("Continuing with known voter addresses only")
+        logger.error(f"Error getting registry voter: {str(e)}")
+        logger.info("Continuing with known voter addresses only")
     
-    print("\nMonitoring voter contracts:")
+    logger.info("\nMonitoring voter contracts:")
     for addr in voter_addresses:
-        print(f"- {addr}")
+        logger.info(f"- {addr}")
     
     # Initialize contracts
     voter_contracts = {
@@ -556,19 +565,19 @@ def main():
         try:
             i += 1
             if i % 100 == 0:
-                print(f"Loops since startup: {i}")
+                logger.info(f"Loops since startup: {i}")
             
             height = w3.eth.get_block_number()
             last_block_written = get_last_block_written()
-            print(f'\nCurrent block height: {height}')
-            print(f'Listening from block {last_block_written}')
+            logger.info(f'\nCurrent block height: {height}')
+            logger.info(f'Listening from block {last_block_written}')
             
             to_block = min(last_block_written + MAX_WIDTH, height)
-            print(f'Will scan to block {to_block}')
+            logger.info(f'Will scan to block {to_block}')
             
             # Process events for each voter contract
             for voter_address, contract in voter_contracts.items():
-                print(f"\nProcessing events for voter: {voter_address}")
+                logger.info(f"\nProcessing events for voter: {voter_address}")
                 try:
                     # ProposalCreated
                     logs = fetch_logs(contract, 'ProposalCreated', last_block_written, to_block)
@@ -595,14 +604,14 @@ def main():
                     for log in logs:
                         handle_proposal_description_updated(log, voter_address)
                 except Exception as e:
-                    print(f"Error processing events for voter {voter_address}: {str(e)}")
+                    logger.error(f"Error processing events for voter {voter_address}: {str(e)}")
                     continue  # Continue with next voter contract
             
             # Check proposal statuses and send alerts
             check_proposal_statuses()
             
         except Exception as e:
-            print(f"Error in main loop: {str(e)}")
+            logger.error(f"Error in main loop: {str(e)}")
         
         time.sleep(POLL_INTERVAL)
 
