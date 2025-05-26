@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import time
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 import sys
 import os
 import telebot
@@ -120,7 +120,7 @@ def send_alert(chat_id, msg):
 def handle_proposal_created(event, voter_address):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M UTC')
+    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     proposal_id = int(event['args']['id'])
@@ -152,13 +152,12 @@ def handle_proposal_created(event, voter_address):
         conn.execute(ins)
         conn.commit()
         
-        # Send alert
-        msg = f"📜 **New Resupply Proposal Created**\n\n"
+        msg = f"📜 *New Resupply Proposal Created*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n\n"
         msg += f"Proposer: {format_address(proposer)}\n"
         msg += f"Epoch: {event['args']['epoch']}\n"
         msg += f"Quorum Required: {event['args']['quorumWeight']:,}\n"
-        msg += f"Ends: {datetime.utcfromtimestamp(end_time).strftime('%Y-%m-%d %H:%M UTC')}\n"
+        msg += f"Ends: {datetime.fromtimestamp(end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
@@ -180,7 +179,7 @@ def get_proposal_description(proposal_id, voter_address):
 def handle_vote_cast(event, voter_address):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M UTC')
+    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     proposal_id = str(event['args']['id'])
@@ -226,7 +225,7 @@ def handle_vote_cast(event, voter_address):
             conn.commit()
             
             # Send alert
-            msg = f"🗳️ **New Vote Cast on Resupply Proposal**\n\n"
+            msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
             msg += f"Proposal {proposal_id}: {description}\n"
             msg += f"Voter: {format_address(voter)}\n"
             if weight_yes > 0:
@@ -251,7 +250,7 @@ def handle_vote_cast(event, voter_address):
 def handle_proposal_cancelled(event, voter_address):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M UTC')
+    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     proposal_id = str(event['args']['proposalId'])
@@ -277,7 +276,7 @@ def handle_proposal_cancelled(event, voter_address):
         conn.commit()
         
         # Send alert
-        msg = f"❌ **Resupply Proposal Cancelled**\n\n"
+        msg = f"❌ *Resupply Proposal Cancelled*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
@@ -292,7 +291,7 @@ def handle_proposal_cancelled(event, voter_address):
 def handle_proposal_executed(event, voter_address):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M UTC')
+    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     proposal_id = str(event['args']['proposalId'])
@@ -320,7 +319,7 @@ def handle_proposal_executed(event, voter_address):
         conn.commit()
         
         # Send alert
-        msg = f"✅ **Resupply Proposal Executed**\n\n"
+        msg = f"✅ *Resupply Proposal Executed*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
@@ -335,7 +334,7 @@ def handle_proposal_executed(event, voter_address):
 def handle_proposal_description_updated(event, voter_address):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M UTC')
+    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     proposal_id = str(event['args']['proposalId'])
@@ -362,7 +361,7 @@ def handle_proposal_description_updated(event, voter_address):
         conn.commit()
         
         # Send alert
-        msg = f"📝 **Resupply Proposal Description Updated**\n\n"
+        msg = f"📝 *Resupply Proposal Description Updated*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
@@ -391,9 +390,9 @@ def check_proposal_statuses():
                 if proposal.status == ProposalStatus.OPEN.value:
                     # Check if proposal is ending in 24 hours
                     if proposal.end_time - current_time <= 24 * 60 * 60:
-                        msg = f"⚠️ **Resupply Proposal Ending Soon**\n\n"
+                        msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                        msg += f"Ends: {datetime.utcfromtimestamp(proposal.end_time).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         msg += f"Current Yes Votes: {proposal.yes_votes:,.0}\n"
                         msg += f"Current No Votes: {proposal.no_votes:,.0}\n"
                         msg += f"Quorum: {proposal.quorum:,.0}\n"
@@ -418,7 +417,7 @@ def check_proposal_statuses():
                                 print(f"Warning: Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
                             conn.commit()
                             
-                            msg = f"🚀 **Resupply Proposal Passed**\n\n"
+                            msg = f"🚀 *Resupply Proposal Passed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                             msg += f"Yes Votes: {proposal.yes_votes:,.0}\n"
                             msg += f"No Votes: {proposal.no_votes:,.0}\n"
@@ -441,7 +440,7 @@ def check_proposal_statuses():
                                 print(f"Warning: Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
                             conn.commit()
                             
-                            msg = f"❌ **Resupply Proposal Failed**\n\n"
+                            msg = f"❌ *Resupply Proposal Failed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                             msg += f"Yes Votes: {proposal.yes_votes:,.0}\n"
                             msg += f"No Votes: {proposal.no_votes:,.0}\n"
@@ -480,9 +479,9 @@ def check_proposal_statuses():
                         conn.execute(update)
                         conn.commit()
                         
-                        msg = f"⏰ Resupply Proposal Ready for Execution\n\n"
+                        msg = f"⏰ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
-                        msg += f"Execution Deadline: {datetime.utcfromtimestamp(proposal.end_time + EXECUTION_DEADLINE).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                     else:
@@ -499,9 +498,9 @@ def check_proposal_statuses():
                         conn.execute(update)
                         conn.commit()
                         
-                        msg = f"⏰ Resupply Proposal Expired\n\n"
+                        msg = f"⏰ *Resupply Proposal Expired*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
-                        msg += f"Execution Deadline: {datetime.utcfromtimestamp(proposal.end_time + EXECUTION_DEADLINE).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
     
