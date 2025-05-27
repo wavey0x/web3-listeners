@@ -84,7 +84,7 @@ def get_last_block_written():
             
             # Get highest block from votes table
             votes_query = select(votes_table.c.block)
-            votes_query = votes_query.order_by(votes_table.c.block.desc()).limit(1)
+            votes_query = votes_query.order_by(votes_query.c.block.desc()).limit(1)
             votes_block = conn.execute(votes_query).scalar()
             
             # Get the highest block between both tables
@@ -503,7 +503,35 @@ def check_proposal_statuses():
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                    else:
+                
+                # For EXECUTION_DELAY proposals, check if they're ready for execution
+                elif proposal.status == ProposalStatus.EXECUTION_DELAY.value:
+                    time_since_passed = current_time - proposal.end_time
+                    
+                    if time_since_passed >= EXECUTION_DELAY and time_since_passed < EXECUTION_DEADLINE:
+                        # Ready for execution
+                        update = proposals_table.update().where(
+                            and_(
+                                proposals_table.c.proposal_id == proposal.proposal_id,
+                                proposals_table.c.voter_address == proposal.voter_address
+                            )
+                        ).values(
+                            status=ProposalStatus.EXECUTABLE.value,
+                            last_updated=current_time
+                        )
+                        conn.execute(update)
+                        conn.commit()
+                        
+                        msg = f"⏰ *Resupply Proposal Ready for Execution*\n\n"
+                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
+                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
+                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+                
+                # Check for expired proposals (both PASSED and EXECUTION_DELAY)
+                if proposal.status in [ProposalStatus.PASSED.value, ProposalStatus.EXECUTION_DELAY.value]:
+                    time_since_passed = current_time - proposal.end_time
+                    if time_since_passed >= EXECUTION_DEADLINE:
                         # Past execution deadline
                         update = proposals_table.update().where(
                             and_(
