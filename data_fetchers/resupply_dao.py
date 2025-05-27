@@ -84,7 +84,7 @@ def get_last_block_written():
             
             # Get highest block from votes table
             votes_query = select(votes_table.c.block)
-            votes_query = votes_query.order_by(votes_query.c.block.desc()).limit(1)
+            votes_query = votes_query.order_by(votes_table.c.block.desc()).limit(1)
             votes_block = conn.execute(votes_query).scalar()
             
             # Get the highest block between both tables
