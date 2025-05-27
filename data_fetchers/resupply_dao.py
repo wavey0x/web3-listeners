@@ -393,7 +393,9 @@ def check_proposal_statuses():
             query = select(proposals_table).where(
                 proposals_table.c.status.in_([
                     ProposalStatus.OPEN.value,
-                    ProposalStatus.PASSED.value
+                    ProposalStatus.PASSED.value,
+                    ProposalStatus.EXECUTION_DELAY.value,
+                    ProposalStatus.EXECUTABLE.value
                 ])
             )
             proposals = conn.execute(query).fetchall()
