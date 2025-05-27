@@ -332,7 +332,7 @@ def handle_proposal_executed(event, voter_address):
         conn.commit()
         
         # Send alert
-        msg = f"✅ *Resupply Proposal Executed*\n\n"
+        msg = f"🚀 *Resupply Proposal Executed*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
@@ -434,7 +434,7 @@ def check_proposal_statuses():
                                 logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
                             conn.commit()
                             
-                            msg = f"🚀 *Resupply Proposal Passed*\n\n"
+                            msg = f"✅ *Resupply Proposal Passed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                             msg += f"Yes: {proposal.yes_votes:,.0f}\n"
                             msg += f"No: {proposal.no_votes:,.0f}\n"
