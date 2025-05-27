@@ -499,7 +499,7 @@ def check_proposal_statuses():
                         conn.execute(update)
                         conn.commit()
                         
-                        msg = f"⏰ *Resupply Proposal Ready for Execution*\n\n"
+                        msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
