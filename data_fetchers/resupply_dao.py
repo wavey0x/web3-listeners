@@ -106,6 +106,7 @@ def send_alert(chat_id, msg):
     while retry_count < MAX_TELEGRAM_RETRIES:
         try:
             bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview=True)
+            logger.info(f"Successfully sent Telegram message to {chat_id}\n{msg}")
             return  # Success, exit the function
         except ApiException as e:
             if e.error_code == 429:  # Rate limit error
