@@ -438,7 +438,7 @@ def check_proposal_statuses():
                             vote_total = proposal.yes_votes + proposal.no_votes
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                             msg += f"Quorum: {quorum_pct:.2f}%\n\n"
-                            msg += f"Executable in 24hrs"
+                            msg += f"Executable in 24hrs\n"
                             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                         else:
