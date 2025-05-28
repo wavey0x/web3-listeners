@@ -39,10 +39,10 @@ EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
 MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
 INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
 VOTING_PERIOD = 60 * 60 * 24 * 7  # 1 week
-PERMASTAKERS = [
-    '0x12341234B35c8a48908c716266db79CAeA0100E8',
-    '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901',
-]
+PERMASTAKERS = {
+    '0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn',
+    '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901': 'Convex',
+}
 # Known voter addresses
 VOTER_ADDRESSES = [
     '0x11111111084a560ea5755Ed904a57e5411888C28',
@@ -77,14 +77,14 @@ def format_address(address):
 def get_last_block_written():
     try:
         with engine.connect() as conn:
-            # Get highest block from proposals table
-            proposals_query = select(proposals_table.c.block)
-            proposals_query = proposals_query.order_by(proposals_table.c.block.desc()).limit(1)
+            # Get highest block from proposals table using a subquery
+            proposals_subquery = select(proposals_table.c.block).order_by(proposals_table.c.block.desc()).limit(1).subquery()
+            proposals_query = select(proposals_subquery.c.block)
             proposals_block = conn.execute(proposals_query).scalar()
             
-            # Get highest block from votes table
-            votes_query = select(votes_table.c.block)
-            votes_query = votes_query.order_by(votes_table.c.block.desc()).limit(1)
+            # Get highest block from votes table using a subquery
+            votes_subquery = select(votes_table.c.block).order_by(votes_table.c.block.desc()).limit(1).subquery()
+            votes_query = select(votes_subquery.c.block)
             votes_block = conn.execute(votes_query).scalar()
             
             # Get the highest block between both tables
@@ -236,19 +236,43 @@ def handle_vote_cast(event, voter_address):
             
             conn.commit()
             
-            # Send alert
-            msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
-            msg += f"Proposal {proposal_id}: {description}\n"
-            msg += f"Voter: {format_address(voter)}\n"
-            if weight_yes > 0:
-                msg += f"Vote: Yes\n"
-                msg += f"Weight: {weight_yes:,.0f}\n"
-            else:
-                msg += f"Vote: No\n"
-                msg += f"Weight: {weight_no:,.0f}\n"
-            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
-            if voter in PERMASTAKERS:
-                send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+            if voter in PERMASTAKERS.keys():
+                voter_name = PERMASTAKERS[voter]
+                # Get the quorum value and vote totals for this proposal
+                query = select(
+                    proposals_table.c.quorum,
+                    proposals_table.c.yes_votes,
+                    proposals_table.c.no_votes
+                ).where(
+                    and_(
+                        proposals_table.c.proposal_id == proposal_id,
+                        proposals_table.c.voter_address == voter_address
+                    )
+                )
+                result = conn.execute(query).first()
+                if result is None:
+                    logger.warning(f"No proposal found for proposal_id {proposal_id} and voter {voter_address}")
+                    return
+                
+                quorum = result.quorum
+                total_yes = result.yes_votes
+                total_no = result.no_votes
+                
+                # Send alert
+                msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
+                msg += f"Proposal {proposal_id}: {description}\n"
+                msg += f"User: {format_address(voter)} ({voter_name})\n"
+                
+                if weight_yes > 0:
+                    msg += f"Vote: Yes ({weight_yes:,.0f})\n"
+                else:
+                    msg += f"Vote: No ({weight_no:,.0f})\n"
+                vote_total = total_yes + total_no
+                quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
+                votes_needed = 0 if vote_total >= quorum else quorum - vote_total
+                msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
+                msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal_id})"
+            
             
     except IntegrityError as e:
         logger.error(f"Integrity error in handle_vote_cast: {str(e)}")
@@ -412,7 +436,8 @@ def check_proposal_statuses():
                         msg += f"No: {proposal.no_votes:,.0f}\n"
                         vote_total = proposal.yes_votes + proposal.no_votes
                         quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                        msg += f"Quorum: {quorum_pct:.2f}%\n\n"
+                        votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
+                        msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                     
@@ -466,7 +491,8 @@ def check_proposal_statuses():
                             msg += f"No: {proposal.no_votes:,.0f}\n"
                             vote_total = proposal.yes_votes + proposal.no_votes
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                            msg += f"Quorum: {quorum_pct:.2f}%\n\n"
+                            votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
+                            msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
                             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
