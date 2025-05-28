@@ -265,18 +265,20 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
         mmddyy = date_obj.strftime('%m/%d/%y')
         
         msg = f"🎯 *RSUP Incentives Report*\n\n"
-        msg += f"Epoch {epoch} - {mmddyy}\n\n"
+        msg += f"Epoch {epoch}: {mmddyy}\n\n"
         
         # Calculate vote-to-spend ratios
         convex_votes = convex_votes_per_usd * convex_amt
         yearn_votes = yearn_votes_per_usd * yearn_amt
         
         msg += f"*Votium*: \n"
-        msg += f"- {convex_votes_per_usd:,.2f} votes/usd\n"
+        votes_per_rsup = convex_votes / convex_amt
+        msg += f"- {votes_per_rsup:,.0f} votes/RSUP\n"
         msg += f"- {convex_votes:,.0f} votes for {convex_amt:,.0f} RSUP\n\n"
         
         msg += f"*Votemarket*: \n"
-        msg += f"- {yearn_votes_per_usd:,.2f} votes/usd\n"
+        votes_per_rsup = yearn_votes / yearn_amt
+        msg += f"- {votes_per_rsup:,.0f} votes/RSUP\n"
         msg += f"- {yearn_votes:,.0f} votes for {yearn_amt:,.0f} RSUP\n\n"
         
         # Add gauge-specific data
@@ -292,6 +294,7 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
         
         # Send to all configured chat IDs
         chat_key = 'WAVEY_ALERTS'
+        chat_key = 'RESUPPLY_ALERTS'
         bot.send_message(CHAT_IDS[chat_key], msg, parse_mode="markdown", disable_web_page_preview=True)
         
     except Exception as e:
