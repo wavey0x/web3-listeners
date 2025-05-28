@@ -19,7 +19,8 @@ def create_tables(metadata):
         Column('transaction_hash', String, nullable=False),
         Column('block_number', BigInteger, nullable=False),
         Column('timestamp', BigInteger, nullable=False),
-        Column('date_str', String, nullable=False)
+        Column('date_str', String, nullable=False),
+        Column('period_start', BigInteger, nullable=False)
     )
 
     return incentives_table 

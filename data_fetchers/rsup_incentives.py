@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, MetaData, select
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import sys
 import os
 import requests
@@ -17,7 +17,7 @@ sys.path.append(parent_dir)
 from constants import CHAT_IDS, RESUPPLY_GAUGES
 import utils
 from schemas.rsup_incentives import create_tables
-from utils.web3_utils import closest_block_before_timestamp
+from utils.web3_utils import closest_block_before_timestamp, closest_block_after_timestamp
 
 load_dotenv()
 
@@ -86,13 +86,10 @@ def get_last_processed_period():
     """Get the last period we've processed from the database"""
     try:
         with engine.connect() as conn:
-            query = select(incentives_table.c.timestamp)
-            query = query.order_by(incentives_table.c.timestamp.desc()).limit(1)
+            query = select(incentives_table.c.period_start)
+            query = query.order_by(incentives_table.c.period_start.desc()).limit(1)
             result = conn.execute(query).scalar()
-            if result is None:
-                return None
-            # Convert timestamp to period
-            return int(result / WEEK) * WEEK
+            return result
     except SQLAlchemyError as e:
         logger.error(f"Database error in get_last_processed_period: {str(e)}")
         raise
@@ -135,7 +132,7 @@ def process_period(period_start):
         logs = rsup.events.Transfer.get_logs(
             argument_filters={'from': EC, 'to': MULTISIG},
             fromBlock=start_block,
-            toBlock=end_block
+            toBlock=min(end_block, w3.eth.block_number)
         )
         
         for log in logs:
@@ -166,27 +163,20 @@ def get_bias(slope: int, end: int, current_period: int) -> int:
         return 0
     return slope * (end - current_period)
 
-def calculate_efficiency(block_number: int, total_incentives: float, convex_amount: float) -> tuple:
+def calculate_efficiency(block_number: int, period_ts: int, total_incentives: float, convex_amount: float) -> tuple:
     """Calculate efficiency metrics for a given block"""
-    try:
-        # Get current period
-        current_period = int(w3.eth.get_block(block_number).timestamp / WEEK) * WEEK
-        next_period = current_period + WEEK
-        
+    try:        
         # Calculate incentives
         votium_incentives = convex_amount / 2  # Divide by 2 because each campaign is 2 weeks
         vecrv_incentives = (total_incentives - convex_amount) / 2
         
-        # Get RSUP price
         rsup_price = get_token_price(RSUP)
         
         # Initialize bias counters
+        gauge_data = {}
         convex_total_bias = 0
         prisma_total_bias = 0
         total_bias = 0
-        
-        # Store gauge-specific data
-        gauge_data = {}
         
         # Calculate biases for each gauge
         for gauge in RESUPPLY_GAUGES:
@@ -201,17 +191,17 @@ def calculate_efficiency(block_number: int, total_incentives: float, convex_amou
                     gauge
                 ).call(block_identifier=block_number)
                 
-                convex_bias = get_bias(convex_slope[0], convex_slope[2], current_period) / 1e18
-                prisma_bias = get_bias(prisma_slope[0], prisma_slope[2], current_period) / 1e18
+                convex_bias = get_bias(convex_slope[0], convex_slope[2], period_ts) / 1e18
+                prisma_bias = get_bias(prisma_slope[0], prisma_slope[2], period_ts) / 1e18
                 total_gauge_bias = gauge_controller.functions.points_weight(
                     gauge, 
-                    next_period
+                    period_ts
                 ).call(block_identifier=block_number)[0] / 1e18
                 
                 # Get relative weight for this gauge
                 relative_weight = gauge_controller.functions.gauge_relative_weight(
                     gauge,
-                    current_period
+                    period_ts
                 ).call(block_identifier=block_number) / 1e18
                 
                 convex_total_bias += convex_bias
@@ -262,10 +252,10 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
     try:
         # Convert date_str to MM/DD/YY format
         date_obj = datetime.strptime(date_str, '%Y-%m-%d %H:%M UTC')
-        mmddyy = date_obj.strftime('%m/%d/%y')
+        mmddyy = (date_obj + timedelta(days=7)).strftime('%m/%d/%y')
         
         msg = f"🎯 *RSUP Incentives Report*\n\n"
-        msg += f"Epoch {epoch}: {mmddyy}\n\n"
+        msg += f"Epoch {epoch} distributions | Effective {mmddyy}\n\n"
         
         # Calculate vote-to-spend ratios
         convex_votes = convex_votes_per_usd * convex_amt
@@ -293,7 +283,7 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
         msg += f"\n🔗 [Distro txn](https://etherscan.io/tx/{txn_hash})"
         
         # Send to all configured chat IDs
-        chat_key = 'WAVEY_ALERTS'
+        # chat_key = 'WAVEY_ALERTS'
         chat_key = 'RESUPPLY_ALERTS'
         bot.send_message(CHAT_IDS[chat_key], msg, parse_mode="markdown", disable_web_page_preview=True)
         
@@ -303,7 +293,6 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
 def handle_incentive_transfer(event):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
     
     try:
@@ -320,8 +309,13 @@ def handle_incentive_transfer(event):
         
         yearn_amt = total - convex_amt
         
-        # Calculate efficiency metrics
-        convex_votes_per_usd, yearn_votes_per_usd, convex_total_bias, vecrv_bias, gauge_data = calculate_efficiency(block, total, convex_amt)
+        # Calc period start and end
+        period_start = int(timestamp / WEEK) * WEEK
+        next_period_start = period_start + WEEK
+        next_period_block = closest_block_after_timestamp(w3, next_period_start)
+        date_str = datetime.fromtimestamp(period_start, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+        convex_votes_per_usd, yearn_votes_per_usd, convex_total_bias, vecrv_bias, gauge_data = calculate_efficiency(next_period_block, next_period_start, total, convex_amt)
         
         ins = incentives_table.insert().values(
             epoch=epoch,
@@ -336,7 +330,8 @@ def handle_incentive_transfer(event):
             transaction_hash=txn_hash,
             block_number=block,
             timestamp=timestamp,
-            date_str=date_str
+            date_str=date_str,
+            period_start=period_start
         )
         
         conn = engine.connect()
