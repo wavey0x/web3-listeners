@@ -260,7 +260,12 @@ def send_telegram_alert(epoch: int, total: float, convex_amt: float, yearn_amt: 
                        date_str: str, txn_hash: str, gauge_data: dict):
     """Send Telegram alert for incentive transfer"""
     try:
-        msg = f"🎯 *RSUP Incentives Report - Epoch {epoch}*\n\n"
+        # Convert date_str to MM/DD/YY format
+        date_obj = datetime.strptime(date_str, '%Y-%m-%d %H:%M UTC')
+        mmddyy = date_obj.strftime('%m/%d/%y')
+        
+        msg = f"🎯 *RSUP Incentives Report*\n\n"
+        msg += f"Epoch {epoch} - {mmddyy}\n\n"
         
         # Calculate vote-to-spend ratios
         convex_votes = convex_votes_per_usd * convex_amt
