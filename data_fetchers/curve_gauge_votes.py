@@ -198,7 +198,7 @@ def get_last_block_written():
 
 def get_gauge_list():
     import requests, re
-    url = 'https://api.curve.fi/api/getAllGauges'
+    url = 'https://api.curve.finance/api/getAllGauges'
     data = requests.get(url).json()['data']
     gauge_list = {}
     for gauge_name, d in data.items():
