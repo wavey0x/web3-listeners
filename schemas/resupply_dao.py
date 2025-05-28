@@ -34,6 +34,7 @@ def create_tables(metadata):
         Column('date_str', String, nullable=False),
         Column('last_updated', BigInteger, nullable=False),
         Column('execution_time', BigInteger),
+        Column('ending_soon_alert_sent', Boolean, nullable=False, default=False),
         UniqueConstraint('proposal_id', 'voter_address', name='uix_proposal_voter')
     )
 

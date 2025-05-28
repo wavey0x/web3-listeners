@@ -427,8 +427,8 @@ def check_proposal_statuses():
             for proposal in proposals:
                 # For OPEN proposals, check if they've ended
                 if proposal.status == ProposalStatus.OPEN.value:
-                    # Check if proposal is ending in 24 hours
-                    if proposal.end_time - current_time <= 24 * 60 * 60:
+                    # Check if proposal is ending in 24 hours and we haven't sent an alert yet
+                    if proposal.end_time - current_time <= 24 * 60 * 60 and not proposal.ending_soon_alert_sent:
                         msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                         msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -440,6 +440,19 @@ def check_proposal_statuses():
                         msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
                         msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{proposal.proposal_id})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+                        
+                        # Mark that we've sent the alert
+                        update = proposals_table.update().where(
+                            and_(
+                                proposals_table.c.proposal_id == proposal.proposal_id,
+                                proposals_table.c.voter_address == proposal.voter_address
+                            )
+                        ).values(
+                            ending_soon_alert_sent=True,
+                            last_updated=current_time
+                        )
+                        conn.execute(update)
+                        conn.commit()
                     
                     # Check if proposal has ended
                     if current_time > proposal.end_time:
