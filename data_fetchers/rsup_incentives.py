@@ -107,10 +107,10 @@ def get_missing_periods():
         # Start from March 19, 2025 timestamp
         start_period = int(1742428800 / WEEK) * WEEK
         # Only include periods up to current time
-        return list(range(start_period, min(current_period + WEEK, current_time), WEEK))
+        return list(range(start_period, current_period, WEEK))
     
     # Get all periods between last processed and current
-    return list(range(last_processed + WEEK, min(current_period + WEEK, current_time), WEEK))
+    return list(range(last_processed + WEEK, current_period, WEEK))
 
 def process_period(period_start):
     """Process all incentive transfers for a given period"""
@@ -118,7 +118,7 @@ def process_period(period_start):
         # Skip if period is in the future
         current_time = int(time.time())
         if period_start > current_time:
-            logger.info(f"Skipping future period {period_start}")
+            logger.info(f"Skipping future period {period_start} (starts {datetime.fromtimestamp(period_start, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})")
             return
             
         # Get block range for this period
@@ -145,7 +145,8 @@ def process_period(period_start):
         
     except Exception as e:
         logger.error(f"Error processing period {period_start}: {str(e)}")
-        raise
+        # Don't re-raise the error, just log it and continue
+        return
 
 def get_token_price(token_address):
     """Get token price from DeFiLlama API"""
@@ -370,10 +371,12 @@ def main():
                     process_period(period)
             else:
                 current_period, next_period = get_periods()
-                logger.info(f"No missing periods. Next period starts at {next_period}")
+                logger.info(f"No missing periods. Next period starts at {next_period} ({datetime.fromtimestamp(next_period, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})")
             
         except Exception as e:
             logger.error(f"Error in main loop: {str(e)}")
+            # Don't re-raise, just log and continue
+            time.sleep(60)  # Wait a bit before retrying
         
         time.sleep(POLL_INTERVAL)
 
