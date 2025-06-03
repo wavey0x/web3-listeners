@@ -480,7 +480,7 @@ def check_proposal_statuses():
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                             msg += f"Quorum: {quorum_pct:.2f}%\n\n"
                             msg += f"Executable in 24hrs\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                         else:
                             # Proposal failed
@@ -506,7 +506,7 @@ def check_proposal_statuses():
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                             votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
                             msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
                 # For PASSED proposals, check execution status
@@ -543,7 +543,7 @@ def check_proposal_statuses():
                         msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
                 # For EXECUTION_DELAY proposals, check if they're ready for execution
@@ -567,7 +567,7 @@ def check_proposal_statuses():
                         msg = f"⏰ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
                 # Check for expired proposals (both PASSED and EXECUTION_DELAY)
