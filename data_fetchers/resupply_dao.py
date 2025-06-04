@@ -39,13 +39,14 @@ EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
 MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
 INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
 VOTING_PERIOD = 60 * 60 * 24 * 7  # 1 week
+DAY_IN_SECONDS = 24 * 60 * 60
 PERMASTAKERS = {
     '0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn',
     '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901': 'Convex',
 }
 # Known voter addresses
 VOTER_ADDRESSES = [
-    '0x11111111084a560ea5755Ed904a57e5411888C28',
+    # '0x11111111084a560ea5755Ed904a57e5411888C28',
     '0x11111111408bd67B92C4f74B9D3cF96f1fa412BC'
 ]
 
@@ -170,7 +171,7 @@ def handle_proposal_created(event, voter_address):
         msg += f"Epoch: {event['args']['epoch']}\n"
         msg += f"Quorum Required: {event['args']['quorumWeight']:,}\n"
         msg += f"Ends: {datetime.fromtimestamp(end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal_id) + 5)})"
+        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except IntegrityError as e:
@@ -271,7 +272,7 @@ def handle_vote_cast(event, voter_address):
                 quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
                 votes_needed = 0 if vote_total >= quorum else quorum - vote_total
                 msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
-                msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal_id) + 5)})"
+                msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/  proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
             
             
     except IntegrityError as e:
@@ -315,7 +316,7 @@ def handle_proposal_cancelled(event, voter_address):
         # Send alert
         msg = f"❌ *Resupply Proposal Cancelled*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal_id) + 5)})"
+        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
@@ -358,7 +359,7 @@ def handle_proposal_executed(event, voter_address):
         # Send alert
         msg = f"🚀 *Resupply Proposal Executed*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal_id) + 5)})"
+        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
@@ -400,7 +401,7 @@ def handle_proposal_description_updated(event, voter_address):
         # Send alert
         msg = f"📝 *Resupply Proposal Description Updated*\n\n"
         msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal_id) + 5)})"
+        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
     except SQLAlchemyError as e:
@@ -425,10 +426,12 @@ def check_proposal_statuses():
             proposals = conn.execute(query).fetchall()
             
             for proposal in proposals:
+                status = proposal.status
                 # For OPEN proposals, check if they've ended
-                if proposal.status == ProposalStatus.OPEN.value:
+                if status == ProposalStatus.OPEN.value:
                     # Check if proposal is ending in 24 hours and we haven't sent an alert yet
-                    if proposal.end_time - current_time <= 24 * 60 * 60 and not proposal.ending_soon_alert_sent:
+                    time_remaining = proposal.end_time - current_time
+                    if time_remaining > 0 and time_remaining <= DAY_IN_SECONDS and not proposal.ending_soon_alert_sent:
                         msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                         msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -438,7 +441,7 @@ def check_proposal_statuses():
                         quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                         votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
                         msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                         
                         # Mark that we've sent the alert
@@ -455,9 +458,11 @@ def check_proposal_statuses():
                         conn.commit()
                     
                     # Check if proposal has ended
-                    if current_time > proposal.end_time:
-                        if proposal.yes_votes > proposal.no_votes:
+                    if time_remaining <= 0:
+                        quorum_met = proposal.yes_votes + proposal.no_votes >= proposal.quorum
+                        if quorum_met and proposal.yes_votes > proposal.no_votes:
                             # Proposal passed
+                            status = ProposalStatus.PASSED.value
                             update = proposals_table.update().where(
                                 and_(
                                     proposals_table.c.proposal_id == proposal.proposal_id,
@@ -480,7 +485,7 @@ def check_proposal_statuses():
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                             msg += f"Quorum: {quorum_pct:.2f}%\n\n"
                             msg += f"Executable in 24hrs\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
+                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                         else:
                             # Proposal failed
@@ -506,14 +511,15 @@ def check_proposal_statuses():
                             quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
                             votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
                             msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
+                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
                 # For PASSED proposals, check execution status
-                elif proposal.status == ProposalStatus.PASSED.value:
+                elif status == ProposalStatus.PASSED.value:
                     time_since_passed = current_time - proposal.end_time
                     
                     if time_since_passed < EXECUTION_DELAY:
+                        status = ProposalStatus.EXECUTION_DELAY.value
                         # In execution delay period
                         update = proposals_table.update().where(
                             and_(
@@ -527,27 +533,10 @@ def check_proposal_statuses():
                         conn.execute(update)
                         conn.commit()
                     elif time_since_passed < EXECUTION_DEADLINE:
-                        # Ready for execution
-                        update = proposals_table.update().where(
-                            and_(
-                                proposals_table.c.proposal_id == proposal.proposal_id,
-                                proposals_table.c.voter_address == proposal.voter_address
-                            )
-                        ).values(
-                            status=ProposalStatus.EXECUTABLE.value,
-                            last_updated=current_time
-                        )
-                        conn.execute(update)
-                        conn.commit()
-                        
-                        msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
-                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
-                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
-                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+                        status = ProposalStatus.EXECUTABLE.value
                 
                 # For EXECUTION_DELAY proposals, check if they're ready for execution
-                elif proposal.status == ProposalStatus.EXECUTION_DELAY.value:
+                elif status == ProposalStatus.EXECUTION_DELAY.value:
                     time_since_passed = current_time - proposal.end_time
                     
                     if time_since_passed >= EXECUTION_DELAY and time_since_passed < EXECUTION_DEADLINE:
@@ -564,14 +553,14 @@ def check_proposal_statuses():
                         conn.execute(update)
                         conn.commit()
                         
-                        msg = f"⏰ *Resupply Proposal Ready for Execution*\n\n"
+                        msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(proposal.proposal_id + 6)})"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                 
                 # Check for expired proposals (both PASSED and EXECUTION_DELAY)
-                if proposal.status in [ProposalStatus.PASSED.value, ProposalStatus.EXECUTION_DELAY.value]:
+                if status in [ProposalStatus.PASSED.value, ProposalStatus.EXECUTION_DELAY.value]:
                     time_since_passed = current_time - proposal.end_time
                     if time_since_passed >= EXECUTION_DEADLINE:
                         # Past execution deadline
@@ -590,7 +579,7 @@ def check_proposal_statuses():
                         msg = f"⌛ *Resupply Proposal Expired*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{str(int(proposal.proposal_id) + 5)})"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                         send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
     
     except SQLAlchemyError as e:
@@ -647,7 +636,7 @@ def main():
             height = w3.eth.get_block_number()
             last_block_written = get_last_block_written()
             to_block = min(last_block_written + MAX_WIDTH, height)
-            if i % 100 == 0:
+            if i % 1000 == 0:
                 logger.info(f"Loops since startup: {i}")
                 logger.info(f'Listening from block {last_block_written} --> {to_block}')
             
@@ -689,6 +678,9 @@ def main():
             logger.error(f"Error in main loop: {str(e)}")
         
         time.sleep(POLL_INTERVAL)
+
+def get_hippo_id(proposal_id):
+    return str(int(proposal_id) + 6)
 
 if __name__ == '__main__':
     main()
