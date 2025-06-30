@@ -34,11 +34,11 @@ DATABASE_URI = os.getenv('DATABASE_URI')
 TELEGRAM_BOT_KEY = os.getenv('WAVEY_ALERTS_BOT_KEY')
 POLL_INTERVAL = 10  # seconds
 MAX_WIDTH = 400_000  # max blocks to scan per iteration
-EXECUTION_DELAY = 24 * 60 * 60  # 24 hours in seconds
+EXECUTION_DELAY = 60 * 60 * 6  # 6 hours in seconds
 EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
 MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
 INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
-VOTING_PERIOD = 60 * 60 * 24 * 7  # 1 week
+VOTING_PERIOD = 60 * 60 * 24 * 3  # 3 days
 DAY_IN_SECONDS = 24 * 60 * 60
 PERMASTAKERS = {
     '0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn',
@@ -47,7 +47,8 @@ PERMASTAKERS = {
 # Known voter addresses
 VOTER_ADDRESSES = [
     # '0x11111111084a560ea5755Ed904a57e5411888C28',
-    '0x11111111408bd67B92C4f74B9D3cF96f1fa412BC'
+    '0x11111111408bd67B92C4f74B9D3cF96f1fa412BC',
+    '0x11111111063874cE8dC6232cb5C1C849359476E6',
 ]
 
 # Connect to Ethereum network
