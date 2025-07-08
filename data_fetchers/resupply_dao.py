@@ -681,7 +681,7 @@ def main():
         time.sleep(POLL_INTERVAL)
 
 def get_hippo_id(proposal_id):
-    return str(int(proposal_id) + 6)
+    return str(int(proposal_id) + 9)
 
 if __name__ == '__main__':
     main()
