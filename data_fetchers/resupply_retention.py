@@ -205,7 +205,7 @@ def handle_weight_set(event):
             else:
                 msg += f"Total Remaining: Unable to fetch\n"
             
-            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash})"
+            msg += f"\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})"
             
             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
         
