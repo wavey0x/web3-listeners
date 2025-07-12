@@ -187,10 +187,10 @@ def handle_weight_set(event):
         # Only send alert if not from deployment block
         if block != DEPLOYMENT_BLOCK:
             # Send alert
-            msg = f"🔁 *Resupply Retention Shares Burned*\n\n"
+            msg = f"🔁 *Retention Shares Checkpointed*\n\n"
             msg += f"User: {format_address(user_address)}\n"
-            msg += f"Shares Burned: {weight_diff_formatted}\n"
-            msg += f"Shares Remaining: {new_weight_formatted}\n"
+            msg += f"Burned: {weight_diff_formatted}\n"
+            msg += f"Remaining: {new_weight_formatted}\n"
             
             # Add total supply info with percentages
             if current_total_supply_eth is not None:
