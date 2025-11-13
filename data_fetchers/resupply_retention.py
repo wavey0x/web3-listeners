@@ -95,7 +95,7 @@ def get_last_block_written():
             if result is None:
                 return DEPLOYMENT_BLOCK
             
-            return result + 1
+            return result
     except SQLAlchemyError as e:
         logger.error(f"Database error in get_last_block_written: {str(e)}")
         raise  # Re-raise to prevent silent failures
@@ -241,7 +241,7 @@ def main():
         try:
             i += 1            
             height = w3.eth.get_block_number()
-            last_block_written = get_last_block_written()
+            last_block_written = get_last_block_written() + 1
             to_block = min(last_block_written + MAX_WIDTH, height)
             
             if i % 1000 == 0:
