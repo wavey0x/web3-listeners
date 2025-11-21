@@ -122,16 +122,19 @@ def process_period(period_start):
         logger.info(f"Block range: {start_block} to {end_block}")
 
         # Get Transfer events from DEPOSIT_DIVIDER for this period
+        logger.info(f"[YB] Fetching Transfer events from {DEPOSIT_DIVIDER}")
         logs = yb.events.Transfer.get_logs(
             argument_filters={'from': DEPOSIT_DIVIDER},
             fromBlock=start_block,
             toBlock=min(end_block, w3.eth.block_number)
         )
 
+        logger.info(f"[YB] Found {len(logs)} Transfer events for period {period_start}")
+
         for log in logs:
             handle_incentive_transfer(log)
 
-        logger.info(f"Completed processing period {period_start}")
+        logger.info(f"[YB] Completed processing period {period_start}")
 
     except Exception as e:
         import traceback
@@ -361,7 +364,7 @@ def main():
         try:
             missing_periods = get_missing_periods()
             if missing_periods:
-                logger.info(f"Found {len(missing_periods)} periods to process")
+                logger.info(f"[YB] Found {len(missing_periods)} periods to process")
                 for period in missing_periods:
                     process_period(period)
             else:

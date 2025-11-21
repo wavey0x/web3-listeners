@@ -127,18 +127,21 @@ def process_period(period_start):
         
         logger.info(f"Processing period {period_start} to {period_end}")
         logger.info(f"Block range: {start_block} to {end_block}")
-        
+
         # Get Transfer events from EC to multisig for this period
+        logger.info(f"[RSUP] Fetching Transfer events from {EC} to {MULTISIG}")
         logs = rsup.events.Transfer.get_logs(
             argument_filters={'from': EC, 'to': MULTISIG},
             fromBlock=start_block,
             toBlock=min(end_block, w3.eth.block_number)
         )
-        
+
+        logger.info(f"[RSUP] Found {len(logs)} Transfer events for period {period_start}")
+
         for log in logs:
             handle_incentive_transfer(log)
-            
-        logger.info(f"Completed processing period {period_start}")
+
+        logger.info(f"[RSUP] Completed processing period {period_start}")
         
     except Exception as e:
         logger.error(f"Error processing period {period_start}: {str(e)}")
@@ -369,7 +372,7 @@ def main():
         try:
             missing_periods = get_missing_periods()
             if missing_periods:
-                logger.info(f"Found {len(missing_periods)} periods to process")
+                logger.info(f"[RSUP] Found {len(missing_periods)} periods to process")
                 for period in missing_periods:
                     process_period(period)
             else:
