@@ -110,14 +110,14 @@ def process_period(period_start):
         if period_start > current_time:
             logger.info(f"Skipping future period {period_start} (starts {datetime.fromtimestamp(period_start, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')})")
             return
-            
+
         # Get block range for this period
         period_end = period_start + WEEK
-        
+
         # Get block numbers for period start and end using helper function
         start_block = closest_block_before_timestamp(w3, period_start)
         end_block = closest_block_before_timestamp(w3, period_end)
-        
+
         logger.info(f"Processing period {period_start} to {period_end}")
         logger.info(f"Block range: {start_block} to {end_block}")
 
@@ -127,14 +127,16 @@ def process_period(period_start):
             fromBlock=start_block,
             toBlock=min(end_block, w3.eth.block_number)
         )
-        
+
         for log in logs:
             handle_incentive_transfer(log)
-            
+
         logger.info(f"Completed processing period {period_start}")
-        
+
     except Exception as e:
+        import traceback
         logger.error(f"Error processing period {period_start}: {str(e)}")
+        logger.error(traceback.format_exc())
         # Don't re-raise the error, just log it and continue
         return
 
