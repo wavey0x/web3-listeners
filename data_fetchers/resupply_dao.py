@@ -52,7 +52,7 @@ VOTER_ADDRESSES = [
 ]
 
 # Connect to Ethereum network
-w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI), request_kwargs={'timeout': 60})
+w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI, request_kwargs={'timeout': 60}))
 if not w3.is_connected():
     raise Exception("Failed to connect to Ethereum node")
 
