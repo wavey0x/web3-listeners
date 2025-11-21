@@ -37,10 +37,14 @@ def run_incentives():
 def run_yb_incentives():
     """Run the YB incentives monitoring service"""
     try:
+        print("DEBUG: YB incentives thread started")
         logger.info("Starting YB incentives service...")
         yb_incentives_main()
     except Exception as e:
-        logger.error(f"Error in YB incentives service: {str(e)}")
+        import traceback
+        error_msg = f"Error in YB incentives service: {str(e)}\n{traceback.format_exc()}"
+        print(f"DEBUG: {error_msg}")
+        logger.error(error_msg)
         # Restart the service after a delay
         time.sleep(60)
         run_yb_incentives()

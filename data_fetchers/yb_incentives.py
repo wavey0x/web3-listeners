@@ -352,7 +352,9 @@ def handle_incentive_transfer(event):
         raise
 
 def main():
+    print("DEBUG: YB incentives main() function called")
     logger.info('Starting YB incentives fetcher')
+    print("DEBUG: YB incentives logger initialized, entering main loop")
     while True:
         try:
             missing_periods = get_missing_periods()
