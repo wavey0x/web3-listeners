@@ -41,7 +41,7 @@ CONTRACT_ADDRESS = '0xB9415639618e70aBb71A0F4F8bbB2643Bf337892'
 DEPLOYMENT_BLOCK = 22870945
 
 # Connect to Ethereum network
-w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
+w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI), request_kwargs={'timeout': 60})
 if not w3.is_connected():
     raise Exception("Failed to connect to Ethereum node")
 
