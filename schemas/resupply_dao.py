@@ -50,7 +50,9 @@ def create_tables(metadata):
         Column('block', BigInteger, nullable=False),
         Column('txn_hash', String, nullable=False),
         Column('timestamp', BigInteger, nullable=False),
-        Column('date_str', String, nullable=False)
+        Column('date_str', String, nullable=False),
+        Column('log_index', Integer, nullable=True),  # To distinguish multiple events in same tx
+        UniqueConstraint('txn_hash', 'log_index', name='uq_resupply_votes_txn_log')
     )
 
     return proposals_table, votes_table 

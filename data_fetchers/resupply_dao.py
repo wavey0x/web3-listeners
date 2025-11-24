@@ -142,9 +142,10 @@ def handle_proposal_created(event, voter_address):
     start_time = timestamp
     end_time = timestamp + VOTING_PERIOD
     
+    description = get_proposal_description(proposal_id, voter_address)
+    
+    # First, try to insert into database - this must succeed before sending alert
     try:
-        description = get_proposal_description(proposal_id, voter_address)
-        
         ins = proposals_table.insert().values(
             proposal_id=proposal_id,
             voter_address=voter_address,
@@ -165,25 +166,23 @@ def handle_proposal_created(event, voter_address):
         conn = engine.connect()
         conn.execute(ins)
         conn.commit()
-        
-        msg = f"📜 *New Resupply Proposal Created*\n\n"
-        msg += f"Proposal {proposal_id}: {description}\n\n"
-        msg += f"Proposer: {format_address(proposer)}\n"
-        msg += f"Epoch: {event['args']['epoch']}\n"
-        msg += f"Quorum Required: {event['args']['quorumWeight']:,}\n"
-        msg += f"Ends: {datetime.fromtimestamp(end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-        
     except IntegrityError as e:
-        logger.error(f"Integrity error in handle_proposal_created: {str(e)}")
-        raise
+        # Duplicate entry - already processed, skip alert
+        logger.warning(f"Duplicate proposal skipped (proposal_id: {proposal_id}, voter: {voter_address}): {str(e)}")
+        return
     except SQLAlchemyError as e:
         logger.error(f"Database error in handle_proposal_created: {str(e)}")
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_proposal_created: {str(e)}")
-        raise
+    
+    # Only send alert AFTER successful database commit
+    msg = f"📜 *New Resupply Proposal Created*\n\n"
+    msg += f"Proposal {proposal_id}: {description}\n\n"
+    msg += f"Proposer: {format_address(proposer)}\n"
+    msg += f"Epoch: {event['args']['epoch']}\n"
+    msg += f"Quorum Required: {event['args']['quorumWeight']:,}\n"
+    msg += f"Ends: {datetime.fromtimestamp(end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
+    msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
+    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
 
 def get_proposal_description(proposal_id, voter_address):
     voter_contract = w3.eth.contract(address=voter_address, abi=voter_abi)
@@ -195,6 +194,7 @@ def handle_vote_cast(event, voter_address):
     timestamp = w3.eth.get_block(block).timestamp
     date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
+    log_index = event.logIndex
     
     proposal_id = str(event['args']['id'])
     voter = event['args']['account']
@@ -202,9 +202,10 @@ def handle_vote_cast(event, voter_address):
     weight_no = event['args']['weightNo']
     description = ""
     
+    description = get_proposal_description(proposal_id, voter_address)
+    
+    # First, try to insert into database - this must succeed before sending alert
     try:
-        description = get_proposal_description(proposal_id, voter_address)
-        
         with engine.connect() as conn:
             # Insert vote
             ins = votes_table.insert().values(
@@ -216,7 +217,8 @@ def handle_vote_cast(event, voter_address):
                 block=block,
                 txn_hash=txn_hash,
                 timestamp=timestamp,
-                date_str=date_str
+                date_str=date_str,
+                log_index=log_index
             )
             conn.execute(ins)
             
@@ -237,54 +239,57 @@ def handle_vote_cast(event, voter_address):
                 logger.warning(f"No proposal found to update for proposal_id {proposal_id} and voter {voter_address}")
             
             conn.commit()
-            
-            if voter in PERMASTAKERS.keys():
-                voter_name = PERMASTAKERS[voter]
-                # Get the quorum value and vote totals for this proposal
-                query = select(
-                    proposals_table.c.quorum,
-                    proposals_table.c.yes_votes,
-                    proposals_table.c.no_votes
-                ).where(
-                    and_(
-                        proposals_table.c.proposal_id == proposal_id,
-                        proposals_table.c.voter_address == voter_address
-                    )
-                )
-                result = conn.execute(query).first()
-                if result is None:
-                    logger.warning(f"No proposal found for proposal_id {proposal_id} and voter {voter_address}")
-                    return
-                
-                quorum = result.quorum
-                total_yes = result.yes_votes
-                total_no = result.no_votes
-                
-                # Send alert
-                msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
-                msg += f"Proposal {proposal_id}: {description}\n"
-                msg += f"User: {format_address(voter)} ({voter_name})\n"
-                
-                if weight_yes > 0:
-                    msg += f"Vote: Yes ({weight_yes:,.0f})\n"
-                else:
-                    msg += f"Vote: No ({weight_no:,.0f})\n"
-                vote_total = total_yes + total_no
-                quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
-                votes_needed = 0 if vote_total >= quorum else quorum - vote_total
-                msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
-                msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/  proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-            
-            
     except IntegrityError as e:
-        logger.error(f"Integrity error in handle_vote_cast: {str(e)}")
-        raise
+        # Duplicate entry - already processed, skip alert
+        logger.warning(f"Duplicate vote skipped (txn: {txn_hash}, log_index: {log_index}): {str(e)}")
+        return
     except SQLAlchemyError as e:
         logger.error(f"Database error in handle_vote_cast: {str(e)}")
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_vote_cast: {str(e)}")
-        raise
+    
+    # Only send alert AFTER successful database commit and only for permastakers
+    if voter not in PERMASTAKERS.keys():
+        return
+    
+    voter_name = PERMASTAKERS[voter]
+    
+    # Get the quorum value and vote totals for this proposal
+    with engine.connect() as conn:
+        query = select(
+            proposals_table.c.quorum,
+            proposals_table.c.yes_votes,
+            proposals_table.c.no_votes
+        ).where(
+            and_(
+                proposals_table.c.proposal_id == proposal_id,
+                proposals_table.c.voter_address == voter_address
+            )
+        )
+        result = conn.execute(query).first()
+        if result is None:
+            logger.warning(f"No proposal found for proposal_id {proposal_id} and voter {voter_address}")
+            return
+        
+        quorum = result.quorum
+        total_yes = result.yes_votes
+        total_no = result.no_votes
+    
+    # Send alert
+    msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
+    msg += f"Proposal {proposal_id}: {description}\n"
+    msg += f"User: {format_address(voter)} ({voter_name})\n"
+    
+    if weight_yes > 0:
+        msg += f"Vote: Yes ({weight_yes:,.0f})\n"
+    else:
+        msg += f"Vote: No ({weight_no:,.0f})\n"
+    vote_total = total_yes + total_no
+    quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
+    votes_needed = 0 if vote_total >= quorum else quorum - vote_total
+    msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
+    msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
+    
+    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
 
 def handle_proposal_cancelled(event, voter_address):
     block = event.blockNumber
@@ -433,19 +438,7 @@ def check_proposal_statuses():
                     # Check if proposal is ending in 24 hours and we haven't sent an alert yet
                     time_remaining = proposal.end_time - current_time
                     if time_remaining > 0 and time_remaining <= DAY_IN_SECONDS and not proposal.ending_soon_alert_sent:
-                        msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
-                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                        msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"Yes: {proposal.yes_votes:,.0f}\n"
-                        msg += f"No: {proposal.no_votes:,.0f}\n"
-                        vote_total = proposal.yes_votes + proposal.no_votes
-                        quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                        votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
-                        msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                        
-                        # Mark that we've sent the alert
+                        # Mark that we've sent the alert BEFORE sending to prevent duplicates
                         update = proposals_table.update().where(
                             and_(
                                 proposals_table.c.proposal_id == proposal.proposal_id,
@@ -457,12 +450,25 @@ def check_proposal_statuses():
                         )
                         conn.execute(update)
                         conn.commit()
+                        
+                        # Send alert AFTER successful commit
+                        msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
+                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
+                        msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
+                        msg += f"Yes: {proposal.yes_votes:,.0f}\n"
+                        msg += f"No: {proposal.no_votes:,.0f}\n"
+                        vote_total = proposal.yes_votes + proposal.no_votes
+                        quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
+                        votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
+                        msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
+                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
+                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                     
                     # Check if proposal has ended
                     if time_remaining <= 0:
                         quorum_met = proposal.yes_votes + proposal.no_votes >= proposal.quorum
                         if quorum_met and proposal.yes_votes > proposal.no_votes:
-                            # Proposal passed
+                            # Proposal passed - update status BEFORE sending alert
                             status = ProposalStatus.PASSED.value
                             update = proposals_table.update().where(
                                 and_(
@@ -476,8 +482,10 @@ def check_proposal_statuses():
                             result = conn.execute(update)
                             if result.rowcount == 0:
                                 logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
+                                continue  # Skip alert if update failed
                             conn.commit()
                             
+                            # Send alert AFTER successful commit
                             msg = f"✅ *Resupply Proposal Passed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                             msg += f"Yes: {proposal.yes_votes:,.0f}\n"
@@ -489,7 +497,7 @@ def check_proposal_statuses():
                             msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
                             send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
                         else:
-                            # Proposal failed
+                            # Proposal failed - update status BEFORE sending alert
                             update = proposals_table.update().where(
                                 and_(
                                     proposals_table.c.proposal_id == proposal.proposal_id,
@@ -502,8 +510,10 @@ def check_proposal_statuses():
                             result = conn.execute(update)
                             if result.rowcount == 0:
                                 logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
+                                continue  # Skip alert if update failed
                             conn.commit()
                             
+                            # Send alert AFTER successful commit
                             msg = f"❌ *Resupply Proposal Failed*\n\n"
                             msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
                             msg += f"Yes: {proposal.yes_votes:,.0f}\n"
@@ -541,7 +551,7 @@ def check_proposal_statuses():
                     time_since_passed = current_time - proposal.end_time
                     
                     if time_since_passed >= EXECUTION_DELAY and time_since_passed < EXECUTION_DEADLINE:
-                        # Ready for execution
+                        # Ready for execution - update status BEFORE sending alert
                         update = proposals_table.update().where(
                             and_(
                                 proposals_table.c.proposal_id == proposal.proposal_id,
@@ -551,9 +561,13 @@ def check_proposal_statuses():
                             status=ProposalStatus.EXECUTABLE.value,
                             last_updated=current_time
                         )
-                        conn.execute(update)
+                        result = conn.execute(update)
+                        if result.rowcount == 0:
+                            logger.warning(f"Failed to update status for proposal {proposal.proposal_id}")
+                            continue
                         conn.commit()
                         
+                        # Send alert AFTER successful commit
                         msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -564,7 +578,7 @@ def check_proposal_statuses():
                 if status in [ProposalStatus.PASSED.value, ProposalStatus.EXECUTION_DELAY.value]:
                     time_since_passed = current_time - proposal.end_time
                     if time_since_passed >= EXECUTION_DEADLINE:
-                        # Past execution deadline
+                        # Past execution deadline - update status BEFORE sending alert
                         update = proposals_table.update().where(
                             and_(
                                 proposals_table.c.proposal_id == proposal.proposal_id,
@@ -574,9 +588,13 @@ def check_proposal_statuses():
                             status=ProposalStatus.EXPIRED.value,
                             last_updated=current_time
                         )
-                        conn.execute(update)
+                        result = conn.execute(update)
+                        if result.rowcount == 0:
+                            logger.warning(f"Failed to update status for proposal {proposal.proposal_id}")
+                            continue
                         conn.commit()
                         
+                        # Send alert AFTER successful commit
                         msg = f"⌛ *Resupply Proposal Expired*\n\n"
                         msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
                         msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"

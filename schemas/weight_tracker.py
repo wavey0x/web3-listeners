@@ -1,4 +1,4 @@
-from sqlalchemy import Table, Column, Integer, String, Float, DateTime, BigInteger, MetaData, Numeric
+from sqlalchemy import Table, Column, Integer, String, Float, DateTime, BigInteger, MetaData, Numeric, UniqueConstraint
 
 def create_tables(metadata):
     """Create tables for weight tracking data"""
@@ -14,7 +14,9 @@ def create_tables(metadata):
         Column('block', BigInteger, nullable=False),
         Column('txn_hash', String, nullable=False),
         Column('timestamp', BigInteger, nullable=False),
-        Column('date_str', String, nullable=False)
+        Column('date_str', String, nullable=False),
+        Column('log_index', Integer, nullable=True),  # To distinguish multiple events in same tx
+        UniqueConstraint('txn_hash', 'log_index', name='uq_weight_changes_txn_log')
     )
 
     return weight_changes_table 

@@ -1,7 +1,7 @@
 from web3 import Web3
 from sqlalchemy import create_engine, MetaData, select
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import time
 from datetime import datetime, timezone, timedelta
 import sys
@@ -297,29 +297,31 @@ def handle_incentive_transfer(event):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
     txn_hash = event.transactionHash.hex()
+    log_index = event.logIndex
     
-    try:
-        epoch = ec.functions.getEpoch().call(block_identifier=block)
-        total = event['args']['value'] / 1e18
-        receipt = w3.eth.get_transaction_receipt(txn_hash)
-        convex_amt = 0
-        for log in receipt['logs']:
-            if log['address'].lower() == RSUP.lower():
-                transfer_event = rsup.events.Transfer().process_log(log)
-                if (transfer_event['args']['from'].lower() == MULTISIG.lower() and 
-                    transfer_event['args']['to'].lower() == CONVEX_DEPLOYER.lower()):
-                    convex_amt += transfer_event['args']['value'] / 1e18
-        
-        yearn_amt = total - convex_amt
-        
-        # Calc period start and end
-        period_start = int(timestamp / WEEK) * WEEK
-        next_period_start = period_start + WEEK
-        next_period_block = closest_block_after_timestamp(w3, next_period_start)
-        date_str = datetime.fromtimestamp(period_start, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+    epoch = ec.functions.getEpoch().call(block_identifier=block)
+    total = event['args']['value'] / 1e18
+    receipt = w3.eth.get_transaction_receipt(txn_hash)
+    convex_amt = 0
+    for log in receipt['logs']:
+        if log['address'].lower() == RSUP.lower():
+            transfer_event = rsup.events.Transfer().process_log(log)
+            if (transfer_event['args']['from'].lower() == MULTISIG.lower() and 
+                transfer_event['args']['to'].lower() == CONVEX_DEPLOYER.lower()):
+                convex_amt += transfer_event['args']['value'] / 1e18
+    
+    yearn_amt = total - convex_amt
+    
+    # Calc period start and end
+    period_start = int(timestamp / WEEK) * WEEK
+    next_period_start = period_start + WEEK
+    next_period_block = closest_block_after_timestamp(w3, next_period_start)
+    date_str = datetime.fromtimestamp(period_start, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
 
-        convex_votes_per_usd, yearn_votes_per_usd, convex_total_bias, vecrv_bias, gauge_data = calculate_efficiency(next_period_block, next_period_start, total, convex_amt)
-        
+    convex_votes_per_usd, yearn_votes_per_usd, convex_total_bias, vecrv_bias, gauge_data = calculate_efficiency(next_period_block, next_period_start, total, convex_amt)
+    
+    # First, try to insert into database - this must succeed before sending alert
+    try:
         ins = incentives_table.insert().values(
             epoch=epoch,
             total_incentives=total,
@@ -334,37 +336,38 @@ def handle_incentive_transfer(event):
             block_number=block,
             timestamp=timestamp,
             date_str=date_str,
-            period_start=period_start
+            period_start=period_start,
+            log_index=log_index
         )
         
         conn = engine.connect()
         conn.execute(ins)
         conn.commit()
-        
-        # Send Telegram alert
-        send_telegram_alert(
-            epoch=epoch,
-            total=total,
-            convex_amt=convex_amt,
-            yearn_amt=yearn_amt,
-            convex_votes_per_usd=convex_votes_per_usd,
-            yearn_votes_per_usd=yearn_votes_per_usd,
-            date_str=date_str,
-            txn_hash=txn_hash,
-            gauge_data=gauge_data
-        )
-        
-        logger.info(f"Processed incentive transfer for epoch {epoch}")
-        logger.info(f"Total RSUP: {total:,.2f}")
-        logger.info(f"Convex RSUP: {convex_amt:,.2f} ({convex_amt / total * 100:.2f}%)")
-        logger.info(f"Yearn RSUP: {yearn_amt:,.2f} ({yearn_amt / total * 100:.2f}%)")
-        
+    except IntegrityError as e:
+        # Duplicate entry - already processed, skip alert
+        logger.warning(f"Duplicate incentive transfer skipped (txn: {txn_hash}): {str(e)}")
+        return
     except SQLAlchemyError as e:
         logger.error(f"Database error in handle_incentive_transfer: {str(e)}")
         raise
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_incentive_transfer: {str(e)}")
-        raise
+    
+    # Only send alert AFTER successful database commit
+    send_telegram_alert(
+        epoch=epoch,
+        total=total,
+        convex_amt=convex_amt,
+        yearn_amt=yearn_amt,
+        convex_votes_per_usd=convex_votes_per_usd,
+        yearn_votes_per_usd=yearn_votes_per_usd,
+        date_str=date_str,
+        txn_hash=txn_hash,
+        gauge_data=gauge_data
+    )
+    
+    logger.info(f"Processed incentive transfer for epoch {epoch}")
+    logger.info(f"Total RSUP: {total:,.2f}")
+    logger.info(f"Convex RSUP: {convex_amt:,.2f} ({convex_amt / total * 100:.2f}%)")
+    logger.info(f"Yearn RSUP: {yearn_amt:,.2f} ({yearn_amt / total * 100:.2f}%)")
 
 def main():
     logger.info('Starting rsup incentives fetcher')

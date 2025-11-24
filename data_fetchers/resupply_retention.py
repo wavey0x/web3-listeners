@@ -137,6 +137,7 @@ def handle_weight_set(event):
     timestamp = w3.eth.get_block(block).timestamp
     date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
     txn_hash = event.transactionHash.hex()
+    log_index = event.logIndex
     
     user_address = event['args']['user']
     old_weight = event['args']['oldWeight']
@@ -148,8 +149,8 @@ def handle_weight_set(event):
     new_weight_eth = new_weight / 10**18
     weight_diff_eth = weight_diff / 10**18
     
+    # First, try to insert into database - this must succeed before sending alert
     try:
-        # Insert weight change record
         ins = weight_changes_table.insert().values(
             user_address=user_address,
             old_weight=old_weight,
@@ -158,66 +159,66 @@ def handle_weight_set(event):
             block=block,
             txn_hash=txn_hash,
             timestamp=timestamp,
-            date_str=date_str
+            date_str=date_str,
+            log_index=log_index
         )
         conn = engine.connect()
         conn.execute(ins)
         conn.commit()
-        
-        # Get current total supply at this block
-        try:
-            current_total_supply = contract.functions.totalSupply().call(block_identifier=block)
-            current_total_supply_eth = current_total_supply / 10**18
-        except Exception as e:
-            logger.error(f"Error getting current total supply: {str(e)}")
-            current_total_supply_eth = None
-        
-        # Calculate percentages if we have original total supply
-        if original_total_supply and current_total_supply_eth:
-            shares_remaining_pct = (current_total_supply_eth / original_total_supply) * 100
-            shares_withdrawn_pct = ((original_total_supply - current_total_supply_eth) / original_total_supply) * 100
-        else:
-            shares_remaining_pct = None
-            shares_withdrawn_pct = None
-        
-        # Format the weight values for display (in ETH)
-        weight_diff_formatted = f"{abs(weight_diff_eth):,.0f}"
-        new_weight_formatted = f"{new_weight_eth:,.0f}"
-        
-        # Only send alert if not from deployment block
-        if block != DEPLOYMENT_BLOCK:
-            # Send alert
-            msg = f"🔁 *Retention Shares Checkpointed*\n\n"
-            msg += f"User: {format_address(user_address)}\n"
-            msg += f"Burned: {weight_diff_formatted}\n"
-            msg += f"Remaining: {new_weight_formatted}\n"
-            
-            # Add total supply info with percentages
-            if current_total_supply_eth is not None:
-                msg += f"\nTotal Remaining: {current_total_supply_eth:,.0f}"
-                if shares_remaining_pct is not None:
-                    msg += f" ({shares_remaining_pct:.1f}%)\n"
-                else:
-                    msg += "\n"
-                
-                if shares_withdrawn_pct is not None:
-                    msg += f"Total Withdrawn: {original_total_supply - current_total_supply_eth:,.0f} ({shares_withdrawn_pct:.1f}%)\n"
-            else:
-                msg += f"Total Remaining: Unable to fetch\n"
-            
-            msg += f"\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})"
-            
-            send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-        
     except IntegrityError as e:
-        logger.error(f"Integrity error in handle_weight_set: {str(e)}")
-        raise
+        # Duplicate entry - already processed, skip alert
+        logger.warning(f"Duplicate event skipped (txn: {txn_hash}): {str(e)}")
+        return
     except SQLAlchemyError as e:
         logger.error(f"Database error in handle_weight_set: {str(e)}")
         raise
+    
+    # Only send alert AFTER successful database commit and not from deployment block
+    if block == DEPLOYMENT_BLOCK:
+        return
+    
+    # Get current total supply at this block
+    try:
+        current_total_supply = contract.functions.totalSupply().call(block_identifier=block)
+        current_total_supply_eth = current_total_supply / 10**18
     except Exception as e:
-        logger.error(f"Unexpected error in handle_weight_set: {str(e)}")
-        raise
+        logger.error(f"Error getting current total supply: {str(e)}")
+        current_total_supply_eth = None
+    
+    # Calculate percentages if we have original total supply
+    if original_total_supply and current_total_supply_eth:
+        shares_remaining_pct = (current_total_supply_eth / original_total_supply) * 100
+        shares_withdrawn_pct = ((original_total_supply - current_total_supply_eth) / original_total_supply) * 100
+    else:
+        shares_remaining_pct = None
+        shares_withdrawn_pct = None
+    
+    # Format the weight values for display (in ETH)
+    weight_diff_formatted = f"{abs(weight_diff_eth):,.0f}"
+    new_weight_formatted = f"{new_weight_eth:,.0f}"
+    
+    # Send alert
+    msg = f"🔁 *Retention Shares Checkpointed*\n\n"
+    msg += f"User: {format_address(user_address)}\n"
+    msg += f"Burned: {weight_diff_formatted}\n"
+    msg += f"Remaining: {new_weight_formatted}\n"
+    
+    # Add total supply info with percentages
+    if current_total_supply_eth is not None:
+        msg += f"\nTotal Remaining: {current_total_supply_eth:,.0f}"
+        if shares_remaining_pct is not None:
+            msg += f" ({shares_remaining_pct:.1f}%)\n"
+        else:
+            msg += "\n"
+        
+        if shares_withdrawn_pct is not None:
+            msg += f"Total Withdrawn: {original_total_supply - current_total_supply_eth:,.0f} ({shares_withdrawn_pct:.1f}%)\n"
+    else:
+        msg += f"Total Remaining: Unable to fetch\n"
+    
+    msg += f"\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})"
+    
+    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
 
 def fetch_logs(contract, event_name, from_block, to_block):
     try:

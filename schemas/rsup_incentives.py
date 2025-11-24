@@ -1,4 +1,4 @@
-from sqlalchemy import Table, Column, Integer, String, Float, BigInteger, MetaData, JSON
+from sqlalchemy import Table, Column, Integer, String, Float, BigInteger, MetaData, JSON, UniqueConstraint
 
 def create_tables(metadata):
     """Create tables for RSUP incentives data"""
@@ -20,7 +20,9 @@ def create_tables(metadata):
         Column('block_number', BigInteger, nullable=False),
         Column('timestamp', BigInteger, nullable=False),
         Column('date_str', String, nullable=False),
-        Column('period_start', BigInteger, nullable=False)
+        Column('period_start', BigInteger, nullable=False),
+        Column('log_index', Integer, nullable=True),  # To distinguish multiple events in same tx
+        UniqueConstraint('transaction_hash', 'log_index', name='uq_rsup_incentives_txn_log')
     )
 
     return incentives_table 
