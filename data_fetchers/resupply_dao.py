@@ -63,7 +63,7 @@ session = Session()
 metadata = MetaData()
 
 # Create tables
-proposals_table, votes_table = create_tables(metadata)
+proposals_table, votes_table, scanner_progress_table = create_tables(metadata)
 metadata.create_all(engine)
 
 # Initialize telegram bot
@@ -79,7 +79,14 @@ def format_address(address):
 def get_last_block_written():
     try:
         with engine.connect() as conn:
-            # Get highest block from proposals table using a subquery
+            # First check scanner_progress_table for last scanned block
+            progress_query = select(scanner_progress_table.c.last_scanned_block).order_by(scanner_progress_table.c.id.desc()).limit(1)
+            last_scanned = conn.execute(progress_query).scalar()
+            
+            if last_scanned is not None:
+                return last_scanned + 1
+            
+            # Fallback: Get highest block from proposals table using a subquery
             proposals_subquery = select(proposals_table.c.block).order_by(proposals_table.c.block.desc()).limit(1).subquery()
             proposals_query = select(proposals_subquery.c.block)
             proposals_block = conn.execute(proposals_query).scalar()
@@ -99,6 +106,22 @@ def get_last_block_written():
     except SQLAlchemyError as e:
         logger.error(f"Database error in get_last_block_written: {str(e)}")
         raise  # Re-raise to prevent silent failures
+
+def update_scanner_progress(block_number):
+    """Update the last scanned block in the database"""
+    try:
+        with engine.connect() as conn:
+            # Insert new progress record
+            ins = scanner_progress_table.insert().values(
+                last_scanned_block=block_number,
+                updated_at=int(time.time())
+            )
+            conn.execute(ins)
+            conn.commit()
+            logger.info(f"Updated scanner progress to block {block_number}")
+    except SQLAlchemyError as e:
+        logger.error(f"Database error in update_scanner_progress: {str(e)}")
+        # Don't raise - we don't want to stop scanning if progress update fails
 
 def send_alert(chat_id, msg):
     """Send a Telegram alert with retry logic for rate limiting."""
@@ -704,6 +727,9 @@ def main():
             
             # Check proposal statuses and send alerts
             check_proposal_statuses()
+            
+            # Update scanner progress after processing all events
+            update_scanner_progress(to_block)
             
         except Exception as e:
             logger.error(f"Error in main loop: {str(e)}")

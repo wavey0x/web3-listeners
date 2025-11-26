@@ -55,4 +55,12 @@ def create_tables(metadata):
         UniqueConstraint('txn_hash', 'log_index', name='uq_resupply_votes_txn_log')
     )
 
-    return proposals_table, votes_table 
+    scanner_progress_table = Table(
+        'resupply_scanner_progress',
+        metadata,
+        Column('id', Integer, primary_key=True, autoincrement=True),
+        Column('last_scanned_block', BigInteger, nullable=False),
+        Column('updated_at', BigInteger, nullable=False)
+    )
+
+    return proposals_table, votes_table, scanner_progress_table 
