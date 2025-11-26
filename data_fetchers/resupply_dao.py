@@ -666,6 +666,9 @@ def main():
                 logger.info(f"Loops since startup: {i}")
                 logger.info(f'Listening from block {last_block_written} --> {to_block}')
             
+            # Log every iteration to see progress
+            logger.info(f'[DAO] Scanning blocks {last_block_written} to {to_block} (current chain height: {height})')
+            
             # Process events for each voter contract
             for voter_address, contract in voter_contracts.items():
                 try:
