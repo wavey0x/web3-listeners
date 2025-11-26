@@ -33,7 +33,7 @@ WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
 TELEGRAM_BOT_KEY = os.getenv('WAVEY_ALERTS_BOT_KEY')
 POLL_INTERVAL = 10  # seconds
-MAX_WIDTH = 400_000  # max blocks to scan per iteration
+MAX_WIDTH = 500_000  # max blocks to scan per iteration
 EXECUTION_DELAY = 60 * 60 * 24  # 24 hours in seconds
 EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
 MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
@@ -696,7 +696,9 @@ def main():
             for voter_address, contract in voter_contracts.items():
                 try:
                     # ProposalCreated
+                    logger.info(f"[DAO] Fetching ProposalCreated events for {voter_address}...")
                     logs = fetch_logs(contract, 'ProposalCreated', last_block_written, to_block)
+                    logger.info(f"[DAO] Got {len(logs)} ProposalCreated events")
                     if logs:
                         logger.info(f"Found {len(logs)} ProposalCreated event(s) for voter {voter_address} in blocks {last_block_written}-{to_block}")
                     for log in logs:
@@ -726,7 +728,9 @@ def main():
                     continue  # Continue with next voter contract
             
             # Check proposal statuses and send alerts
+            logger.info(f"[DAO] Checking proposal statuses...")
             check_proposal_statuses()
+            logger.info(f"[DAO] Proposal status check complete")
             
             # Update scanner progress after processing all events
             update_scanner_progress(to_block)
