@@ -132,6 +132,8 @@ def send_alert(chat_id, msg):
         logger.error(f"Message was: {msg}")
 
 def handle_proposal_created(event, voter_address):
+    logger.info(f"Processing ProposalCreated: proposal_id={event['args']['id']}, voter={voter_address}, block={event.blockNumber}, tx={event.transactionHash.hex()}")
+    
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
     date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
@@ -142,10 +144,13 @@ def handle_proposal_created(event, voter_address):
     start_time = timestamp
     end_time = timestamp + VOTING_PERIOD
     
+    logger.info(f"Fetching description for proposal {proposal_id} from voter {voter_address}")
     description = get_proposal_description(proposal_id, voter_address)
+    logger.info(f"Got description for proposal {proposal_id}: {description[:50] if description else 'empty'}...")
     
     # First, try to insert into database - this must succeed before sending alert
     try:
+        logger.info(f"Attempting to insert proposal {proposal_id} into database")
         ins = proposals_table.insert().values(
             proposal_id=proposal_id,
             voter_address=voter_address,
@@ -166,6 +171,7 @@ def handle_proposal_created(event, voter_address):
         conn = engine.connect()
         conn.execute(ins)
         conn.commit()
+        logger.info(f"Successfully inserted proposal {proposal_id} into database")
     except IntegrityError as e:
         # Duplicate entry - already processed, skip alert
         logger.warning(f"Duplicate proposal skipped (proposal_id: {proposal_id}, voter: {voter_address}): {str(e)}")
@@ -175,6 +181,7 @@ def handle_proposal_created(event, voter_address):
         raise
     
     # Only send alert AFTER successful database commit
+    logger.info(f"Sending alert for proposal {proposal_id}")
     msg = f"📜 *New Resupply Proposal Created*\n\n"
     msg += f"Proposal {proposal_id}: {description}\n\n"
     msg += f"Proposer: {format_address(proposer)}\n"
@@ -664,6 +671,8 @@ def main():
                 try:
                     # ProposalCreated
                     logs = fetch_logs(contract, 'ProposalCreated', last_block_written, to_block)
+                    if logs:
+                        logger.info(f"Found {len(logs)} ProposalCreated event(s) for voter {voter_address} in blocks {last_block_written}-{to_block}")
                     for log in logs:
                         handle_proposal_created(log, voter_address)
                     
@@ -687,7 +696,7 @@ def main():
                     for log in logs:
                         handle_proposal_description_updated(log, voter_address)
                 except Exception as e:
-                    logger.error(f"Error processing events for voter {voter_address}: {str(e)}")
+                    logger.error(f"Error processing events for voter {voter_address}: {str(e)}", exc_info=True)
                     continue  # Continue with next voter contract
             
             # Check proposal statuses and send alerts
