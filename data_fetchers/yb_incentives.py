@@ -1,7 +1,7 @@
 from web3 import Web3
 from sqlalchemy import create_engine, MetaData, select
 from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 import time
 from datetime import datetime, timezone, timedelta
 import sys
@@ -313,6 +313,7 @@ def handle_incentive_transfer(event):
 
         votium_votes_per_usd, votemarket_votes_per_usd, votium_total_bias, votemarket_bias, gauge_data = calculate_efficiency(next_period_block, next_period_start, total, votium_amt)
 
+        # First, try to insert into database - this must succeed before sending alert
         ins = incentives_table.insert().values(
             total_incentives=total,
             votium_amount=votium_amt,
@@ -334,29 +335,33 @@ def handle_incentive_transfer(event):
         conn.execute(ins)
         conn.commit()
 
-        # Send Telegram alert
-        send_telegram_alert(
-            total=total,
-            votium_amt=votium_amt,
-            votemarket_amt=votemarket_amt,
-            votium_votes=votium_total_bias,
-            votemarket_votes=votemarket_bias,
-            date_str=date_str,
-            txn_hash=txn_hash,
-            gauge_data=gauge_data
-        )
-
-        logger.info(f"Processed incentive transfer")
-        logger.info(f"Total YB: {total:,.2f}")
-        logger.info(f"Votium YB: {votium_amt:,.2f} ({votium_amt / total * 100:.2f}%)")
-        logger.info(f"Votemarket YB: {votemarket_amt:,.2f} ({votemarket_amt / total * 100:.2f}%)")
-
+    except IntegrityError as e:
+        # Duplicate entry - already processed, skip alert
+        logger.warning(f"Duplicate incentive transfer skipped (txn: {txn_hash}): {str(e)}")
+        return
     except SQLAlchemyError as e:
         logger.error(f"Database error in handle_incentive_transfer: {str(e)}")
         raise
     except Exception as e:
         logger.error(f"Unexpected error in handle_incentive_transfer: {str(e)}")
         raise
+
+    # Only send alert AFTER successful database commit
+    send_telegram_alert(
+        total=total,
+        votium_amt=votium_amt,
+        votemarket_amt=votemarket_amt,
+        votium_votes=votium_total_bias,
+        votemarket_votes=votemarket_bias,
+        date_str=date_str,
+        txn_hash=txn_hash,
+        gauge_data=gauge_data
+    )
+
+    logger.info(f"Processed incentive transfer")
+    logger.info(f"Total YB: {total:,.2f}")
+    logger.info(f"Votium YB: {votium_amt:,.2f} ({votium_amt / total * 100:.2f}%)")
+    logger.info(f"Votemarket YB: {votemarket_amt:,.2f} ({votemarket_amt / total * 100:.2f}%)")
 
 def main():
     print("DEBUG: YB incentives main() function called")

@@ -303,12 +303,24 @@ def handle_incentive_transfer(event):
     total = event['args']['value'] / 1e18
     receipt = w3.eth.get_transaction_receipt(txn_hash)
     convex_amt = 0
+    # Transfer event signature: keccak256("Transfer(address,address,uint256)")
+    transfer_topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+    
     for log in receipt['logs']:
-        if log['address'].lower() == RSUP.lower():
-            transfer_event = rsup.events.Transfer().process_log(log)
-            if (transfer_event['args']['from'].lower() == MULTISIG.lower() and 
-                transfer_event['args']['to'].lower() == CONVEX_DEPLOYER.lower()):
-                convex_amt += transfer_event['args']['value'] / 1e18
+        if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_topic:
+            try:
+                transfer_event = rsup.events.Transfer().process_log(log)
+                # RSUP token might use 'sender' and 'receiver' parameter names instead of 'from' and 'to'
+                from_addr = transfer_event['args'].get('sender') or transfer_event['args'].get('from')
+                to_addr = transfer_event['args'].get('receiver') or transfer_event['args'].get('to')
+                value = transfer_event['args']['value'] / 1e18
+                
+                if (from_addr.lower() == MULTISIG.lower() and 
+                    to_addr.lower() == CONVEX_DEPLOYER.lower()):
+                    convex_amt += value
+            except Exception:
+                # Not a Transfer event or different event signature, skip it
+                continue
     
     yearn_amt = total - convex_amt
     
