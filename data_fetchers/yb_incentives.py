@@ -278,6 +278,7 @@ def handle_incentive_transfer(event):
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
     txn_hash = event.transactionHash.hex()
+    log_index = event.logIndex
 
     try:
         total = event['args']['value'] / 1e18
@@ -325,7 +326,8 @@ def handle_incentive_transfer(event):
             block_number=block,
             timestamp=timestamp,
             date_str=date_str,
-            period_start=period_start
+            period_start=period_start,
+            log_index=log_index
         )
 
         conn = engine.connect()
