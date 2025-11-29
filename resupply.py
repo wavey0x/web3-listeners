@@ -1,4 +1,5 @@
 import os
+import sys
 import time
 import logging
 import threading
@@ -12,9 +13,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Ensure project root on path so package imports work when launched from elsewhere
+ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
+if ROOT_DIR not in sys.path:
+    sys.path.append(ROOT_DIR)
+
 # Import the main functions from all scripts
-from data_fetchers.rsup_incentives import main as incentives_main
-from data_fetchers.yb_incentives import main as yb_incentives_main
+from incentives.rsup_incentives import main as incentives_main
+from incentives.yb_incentives import main as yb_incentives_main
 from data_fetchers.resupply_dao import main as dao_main
 from data_fetchers.resupply_retention import main as retention_main
 
