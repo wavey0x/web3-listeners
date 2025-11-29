@@ -1,5 +1,4 @@
 import os
-import sys
 import time
 import logging
 import threading
@@ -13,63 +12,55 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Add the parent directory to sys.path
-parent_dir = os.path.abspath(os.path.dirname(__file__))
-sys.path.append(parent_dir)
-
 # Import the main functions from all scripts
-from data_fetchers.rsup_incentives import main as incentives_main
-from data_fetchers.yb_incentives import main as yb_incentives_main
+from incentives.rsup_incentives import main as incentives_main
+from incentives.yb_incentives import main as yb_incentives_main
 from data_fetchers.resupply_dao import main as dao_main
 from data_fetchers.resupply_retention import main as retention_main
 
 def run_incentives():
     """Run the RSUP incentives monitoring service"""
-    try:
-        logger.info("Starting RSUP incentives service...")
-        incentives_main()
-    except Exception as e:
-        logger.error(f"Error in RSUP incentives service: {str(e)}")
-        # Restart the service after a delay
-        time.sleep(60)
-        run_incentives()
+    while True:
+        try:
+            logger.info("Starting RSUP incentives service...")
+            incentives_main()
+        except Exception as e:
+            logger.error(f"Error in RSUP incentives service: {str(e)}")
+            time.sleep(60)
 
 def run_yb_incentives():
     """Run the YB incentives monitoring service"""
-    try:
-        print("DEBUG: YB incentives thread started")
-        logger.info("Starting YB incentives service...")
-        yb_incentives_main()
-    except Exception as e:
-        import traceback
-        error_msg = f"Error in YB incentives service: {str(e)}\n{traceback.format_exc()}"
-        print(f"DEBUG: {error_msg}")
-        logger.error(error_msg)
-        # Restart the service after a delay
-        time.sleep(60)
-        run_yb_incentives()
+    while True:
+        try:
+            print("DEBUG: YB incentives thread started")
+            logger.info("Starting YB incentives service...")
+            yb_incentives_main()
+        except Exception as e:
+            import traceback
+            error_msg = f"Error in YB incentives service: {str(e)}\n{traceback.format_exc()}"
+            print(f"DEBUG: {error_msg}")
+            logger.error(error_msg)
+            time.sleep(60)
 
 def run_dao():
     """Run the Resupply DAO monitoring service"""
-    try:
-        logger.info("Starting Resupply DAO service...")
-        dao_main()
-    except Exception as e:
-        logger.error(f"Error in Resupply DAO service: {str(e)}")
-        # Restart the service after a delay
-        time.sleep(60)
-        run_dao()
+    while True:
+        try:
+            logger.info("Starting Resupply DAO service...")
+            dao_main()
+        except Exception as e:
+            logger.error(f"Error in Resupply DAO service: {str(e)}")
+            time.sleep(60)
 
 def run_retention():
     """Run the Resupply Retention monitoring service"""
-    try:
-        logger.info("Starting Resupply Retention service...")
-        retention_main()
-    except Exception as e:
-        logger.error(f"Error in Resupply Retention service: {str(e)}")
-        # Restart the service after a delay
-        time.sleep(60)
-        run_retention()
+    while True:
+        try:
+            logger.info("Starting Resupply Retention service...")
+            retention_main()
+        except Exception as e:
+            logger.error(f"Error in Resupply Retention service: {str(e)}")
+            time.sleep(60)
 
 def main():
     """Main entry point that runs all services in separate threads"""
