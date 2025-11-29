@@ -13,8 +13,8 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Import the main functions from all scripts
-from incentives.rsup_incentives import main as incentives_main
-from incentives.yb_incentives import main as yb_incentives_main
+from data_fetchers.rsup_incentives import main as incentives_main
+from data_fetchers.yb_incentives import main as yb_incentives_main
 from data_fetchers.resupply_dao import main as dao_main
 from data_fetchers.resupply_retention import main as retention_main
 
