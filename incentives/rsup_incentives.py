@@ -310,9 +310,17 @@ def handle_incentive_transfer(event):
     logger.info(f"[DEBUG] VOTIUM={VOTIUM.lower()}, VOTIUM_FEE={VOTIUM_FEE.lower()}")
     logger.info(f"[DEBUG] VOTEMARKET_FACTORY={VOTEMARKET_FACTORY.lower()}")
 
+    # Debug: show first 5 unique log addresses
+    unique_addrs = list(set(log['address'].lower() for log in receipt['logs']))[:5]
+    logger.info(f"[DEBUG] Sample log addresses: {unique_addrs}")
+
     rsup_transfer_count = 0
     for log in receipt['logs']:
-        if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_sig:
+        # Normalize topic - remove 0x prefix if present for comparison
+        topic0 = log['topics'][0].hex() if len(log['topics']) > 0 else ''
+        topic0_normalized = topic0.replace('0x', '').lower()
+
+        if log['address'].lower() == RSUP.lower() and topic0_normalized == transfer_sig:
             rsup_transfer_count += 1
             try:
                 to_addr = '0x' + log['topics'][2].hex()[-40:]
