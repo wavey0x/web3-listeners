@@ -305,8 +305,15 @@ def handle_incentive_transfer(event):
     votium_new_pattern = 0  # Direct to VOTIUM + VOTIUM_FEE
     votium_old_pattern = 0  # Via CONVEX_DEPLOYER
 
+    logger.info(f"[DEBUG] Processing {len(receipt['logs'])} logs from txn {txn_hash}")
+    logger.info(f"[DEBUG] Looking for RSUP={RSUP.lower()}")
+    logger.info(f"[DEBUG] VOTIUM={VOTIUM.lower()}, VOTIUM_FEE={VOTIUM_FEE.lower()}")
+    logger.info(f"[DEBUG] VOTEMARKET_FACTORY={VOTEMARKET_FACTORY.lower()}")
+
+    rsup_transfer_count = 0
     for log in receipt['logs']:
         if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_sig:
+            rsup_transfer_count += 1
             try:
                 to_addr = '0x' + log['topics'][2].hex()[-40:]
                 data_hex = log['data'].hex()
@@ -315,15 +322,21 @@ def handle_incentive_transfer(event):
                 # New pattern: direct Votium deposits
                 if to_addr.lower() == VOTIUM.lower() or to_addr.lower() == VOTIUM_FEE.lower():
                     votium_new_pattern += value
+                    logger.info(f"[DEBUG] VOTIUM match: {value:,.2f} to {to_addr}")
                 # Old pattern: Votium via Convex deployer
                 elif to_addr.lower() == CONVEX_DEPLOYER.lower():
                     votium_old_pattern += value
+                    logger.info(f"[DEBUG] CONVEX match: {value:,.2f} to {to_addr}")
                 # Votemarket deposits (same for both patterns)
                 elif to_addr.lower() == VOTEMARKET_FACTORY.lower():
                     votemarket_amt += value
+                    logger.info(f"[DEBUG] VOTEMARKET match: {value:,.2f} to {to_addr}")
             except Exception as e:
                 logger.warning(f"Failed to parse transfer log: {e}")
                 continue
+
+    logger.info(f"[DEBUG] Found {rsup_transfer_count} RSUP transfers")
+    logger.info(f"[DEBUG] votium_new={votium_new_pattern:,.2f}, votium_old={votium_old_pattern:,.2f}, votemarket={votemarket_amt:,.2f}")
 
     # Use new pattern if present, otherwise fall back to old pattern
     if votium_new_pattern > 0:
