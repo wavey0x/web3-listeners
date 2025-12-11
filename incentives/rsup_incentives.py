@@ -47,9 +47,11 @@ EC = '0x33333333df05b0D52edD13D230461E5A0f5a4706'
 MULTISIG = '0xFE11a5009f2121622271e7dd0FD470264e076af6'
 GAUGE_CONTROLLER = '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
 
-# Votium addresses
+# Votium addresses (new pattern - direct deposits)
 VOTIUM = '0x63942E31E98f1833A234077f47880A66136a2D1e'
 VOTIUM_FEE = '0x29e3b0E8dF4Ee3f71a62C34847c34E139fC0b297'
+# Votium address (old pattern - via Convex deployer)
+CONVEX_DEPLOYER = '0x947B7742C403f20e5FaCcDAc5E092C943E7D0277'
 
 # Votemarket address
 VOTEMARKET_FACTORY = '0x96006425Da428E45c282008b00004a00002B345e'
@@ -299,24 +301,40 @@ def handle_incentive_transfer(event):
     # Transfer event signature: keccak256("Transfer(address,address,uint256)") - no 0x prefix for comparison
     transfer_sig = 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
 
+    # Track amounts for both old and new Votium patterns
+    votium_new_pattern = 0  # Direct to VOTIUM + VOTIUM_FEE
+    votium_old_pattern = 0  # Via CONVEX_DEPLOYER
+
     for log in receipt['logs']:
         if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_sig:
             try:
-                # Decode transfer from topics and data
                 to_addr = '0x' + log['topics'][2].hex()[-40:]
-                value = int(log['data'].hex(), 16) / 1e18
+                data_hex = log['data'].hex()
+                value = int(data_hex, 16) / 1e18
 
-                # Track Votium deposits (to Votium main + fee address)
+                # New pattern: direct Votium deposits
                 if to_addr.lower() == VOTIUM.lower() or to_addr.lower() == VOTIUM_FEE.lower():
-                    votium_amt += value
-                # Track Votemarket deposits (to Votemarket factory)
+                    votium_new_pattern += value
+                # Old pattern: Votium via Convex deployer
+                elif to_addr.lower() == CONVEX_DEPLOYER.lower():
+                    votium_old_pattern += value
+                # Votemarket deposits (same for both patterns)
                 elif to_addr.lower() == VOTEMARKET_FACTORY.lower():
                     votemarket_amt += value
-            except Exception:
-                # Not a Transfer event or different event signature, skip it
+            except Exception as e:
+                logger.warning(f"Failed to parse transfer log: {e}")
                 continue
 
+    # Use new pattern if present, otherwise fall back to old pattern
+    if votium_new_pattern > 0:
+        votium_amt = votium_new_pattern
+        logger.info(f"Using new Votium pattern (direct deposits): {votium_amt:,.2f} RSUP")
+    else:
+        votium_amt = votium_old_pattern
+        logger.info(f"Using old Votium pattern (via Convex): {votium_amt:,.2f} RSUP")
+
     total = votium_amt + votemarket_amt
+    logger.info(f"Parsed transfers - Votium: {votium_amt:,.2f}, Votemarket: {votemarket_amt:,.2f}, Total: {total:,.2f}")
     
     # Calc period start and end
     period_start = int(timestamp / WEEK) * WEEK
