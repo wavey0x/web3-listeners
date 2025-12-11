@@ -16,7 +16,7 @@ INCENTIVES_ENV = os.getenv("INCENTIVES_ENV", "prod").lower()
 DEV_MODE = INCENTIVES_ENV == "dev"
 ALERT_CHAT_KEYS = {
     "yieldbasis": os.getenv("YB_ALERTS_CHAT_KEY", "WAVEY_ALERTS"),
-    "resupply": os.getenv("RSUP_ALERTS_CHAT_KEY", "WAVEY_ALERTS"),
+    "resupply": os.getenv("RSUP_ALERTS_CHAT_KEY", "RESUPPLY_ALERTS"),
 }
 DEV_CHAT_KEY = "WAVEY_ALERTS"
 

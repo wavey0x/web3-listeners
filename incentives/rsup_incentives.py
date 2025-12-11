@@ -42,11 +42,18 @@ PROTOCOL = 'resupply'
 bot = telebot.TeleBot(TELEGRAM_BOT_TOKEN)
 
 # Contract addresses
-CONVEX_DEPLOYER = '0x947B7742C403f20e5FaCcDAc5E092C943E7D0277'
 RSUP = '0x419905009e4656fdC02418C7Df35B1E61Ed5F726'
 EC = '0x33333333df05b0D52edD13D230461E5A0f5a4706'
 MULTISIG = '0xFE11a5009f2121622271e7dd0FD470264e076af6'
 GAUGE_CONTROLLER = '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
+
+# Votium addresses
+VOTIUM = '0x63942E31E98f1833A234077f47880A66136a2D1e'
+VOTIUM_FEE = '0x29e3b0E8dF4Ee3f71a62C34847c34E139fC0b297'
+
+# Votemarket address
+VOTEMARKET_FACTORY = '0x96006425Da428E45c282008b00004a00002B345e'
+
 CURVE_VOTERS = {
     'CONVEX': '0x989AEb4d175e16225E39E87d0D97A3360524AD80',
     'PRISMA': '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
@@ -284,31 +291,32 @@ def handle_incentive_transfer(event):
     timestamp = w3.eth.get_block(block).timestamp
     txn_hash = event.transactionHash.hex()
     log_index = event.logIndex
-    
+
     epoch = ec.functions.getEpoch().call(block_identifier=block)
-    total = event['args']['value'] / 1e18
     receipt = w3.eth.get_transaction_receipt(txn_hash)
     votium_amt = 0
-    # Transfer event signature: keccak256("Transfer(address,address,uint256)")
-    transfer_topic = '0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
-    
+    votemarket_amt = 0
+    # Transfer event signature: keccak256("Transfer(address,address,uint256)") - no 0x prefix for comparison
+    transfer_sig = 'ddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'
+
     for log in receipt['logs']:
-        if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_topic:
+        if log['address'].lower() == RSUP.lower() and len(log['topics']) > 0 and log['topics'][0].hex() == transfer_sig:
             try:
-                transfer_event = rsup.events.Transfer().process_log(log)
-                # RSUP token might use 'sender' and 'receiver' parameter names instead of 'from' and 'to'
-                from_addr = transfer_event['args'].get('sender') or transfer_event['args'].get('from')
-                to_addr = transfer_event['args'].get('receiver') or transfer_event['args'].get('to')
-                value = transfer_event['args']['value'] / 1e18
-                
-                if (from_addr.lower() == MULTISIG.lower() and 
-                    to_addr.lower() == CONVEX_DEPLOYER.lower()):
+                # Decode transfer from topics and data
+                to_addr = '0x' + log['topics'][2].hex()[-40:]
+                value = int(log['data'].hex(), 16) / 1e18
+
+                # Track Votium deposits (to Votium main + fee address)
+                if to_addr.lower() == VOTIUM.lower() or to_addr.lower() == VOTIUM_FEE.lower():
                     votium_amt += value
+                # Track Votemarket deposits (to Votemarket factory)
+                elif to_addr.lower() == VOTEMARKET_FACTORY.lower():
+                    votemarket_amt += value
             except Exception:
                 # Not a Transfer event or different event signature, skip it
                 continue
-    
-    votemarket_amt = total - votium_amt
+
+    total = votium_amt + votemarket_amt
     
     # Calc period start and end
     period_start = int(timestamp / WEEK) * WEEK
