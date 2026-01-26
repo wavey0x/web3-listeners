@@ -40,6 +40,7 @@ MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
 INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
 VOTING_PERIOD = 60 * 60 * 24 * 7  # 7 days
 DAY_IN_SECONDS = 24 * 60 * 60
+VOTE_ALERT_POWER_THRESHOLD = 1_000_000
 PERMASTAKERS = {
     '0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn',
     '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901': 'Convex',
@@ -277,11 +278,12 @@ def handle_vote_cast(event, voter_address):
         logger.error(f"Database error in handle_vote_cast: {str(e)}")
         raise
     
-    # Only send alert AFTER successful database commit and only for permastakers
-    if voter not in PERMASTAKERS.keys():
+    # Only send alert AFTER successful database commit and only for 1M+ voting power
+    voting_power = weight_yes + weight_no
+    if voting_power < VOTE_ALERT_POWER_THRESHOLD:
         return
     
-    voter_name = PERMASTAKERS[voter]
+    voter_name = PERMASTAKERS.get(voter)
     
     # Get the quorum value and vote totals for this proposal
     with engine.connect() as conn:
@@ -305,9 +307,18 @@ def handle_vote_cast(event, voter_address):
         total_no = result.no_votes
     
     # Send alert
+    logger.info(
+        "Sending vote alert for proposal %s by %s with voting power %s",
+        proposal_id,
+        voter,
+        f"{voting_power:,.0f}"
+    )
     msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
     msg += f"Proposal {proposal_id}: {description}\n"
-    msg += f"User: {format_address(voter)} ({voter_name})\n"
+    if voter_name:
+        msg += f"User: {format_address(voter)} ({voter_name})\n"
+    else:
+        msg += f"User: {format_address(voter)}\n"
     
     if weight_yes > 0:
         msg += f"Vote: Yes ({weight_yes:,.0f})\n"
