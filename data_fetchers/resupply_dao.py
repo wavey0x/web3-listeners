@@ -316,7 +316,7 @@ def handle_vote_cast(event, voter_address):
     vote_total = total_yes + total_no
     quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
     votes_needed = 0 if vote_total >= quorum else quorum - vote_total
-    msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
+    msg += f"Quorum Progress: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
     msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
     
     send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
