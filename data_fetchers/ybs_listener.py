@@ -18,7 +18,7 @@ load_dotenv()
 WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
 DATABASE_URI = os.getenv('DATABASE_URI')
 DEPLOY_BLOCK=19888353
-MAX_WIDTH = 200_000
+MAX_WIDTH = 50_000
 POLL_INTERVAL = 120 # seconds
 
 # Connect to Ethereum network
@@ -133,10 +133,15 @@ def handle_stake_event(event, decimals):
 
 def fetch_logs(contract, event_name, from_block, to_block):
     event = getattr(contract.events, event_name)
-    logs = event.get_logs(
-        fromBlock=from_block,
-        toBlock=to_block
-    )
+    logs = []
+    start = from_block
+    while start <= to_block:
+        end = min(start + MAX_WIDTH - 1, to_block)
+        logs.extend(event.get_logs(
+            fromBlock=start,
+            toBlock=end
+        ))
+        start = end + 1
     return logs
 
 def handle_reward_event(event, decimals, is_claim):
