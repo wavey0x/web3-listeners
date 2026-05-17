@@ -4,7 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from psycopg2 import errors
 import time, os, json, sys
-from datetime import datetime
+from datetime import datetime, timezone
 # Add the parent directory of the current file to sys.path
 parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 sys.path.append(parent_dir)
@@ -98,7 +98,7 @@ def handle_stake_event(event, decimals):
     if 'weightRemoved' in event['args']:
         weight_change = event['args']['weightRemoved'] / 10 ** decimals
     timestamp = block.timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     txn_hash = event.transactionHash.hex()
     token = deployments_by_ybs[event.address]['token']
     # Inserting data into the PostgreSQL database
@@ -156,7 +156,7 @@ def handle_reward_event(event, decimals, is_claim):
     week = event['args']['week']
     ybs = deployments_by_rewards[event.address]['ybs']
     timestamp = block.timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     txn_hash = event.transactionHash.hex()
     token = deployments_by_rewards[event.address]['token']
     # Inserting data into the PostgreSQL database

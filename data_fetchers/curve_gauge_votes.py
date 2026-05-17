@@ -5,7 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from psycopg2 import errors
 import time, os, json, sys
 import telebot
-from datetime import datetime
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 
 # Add the parent directory of the current file to sys.path
@@ -104,7 +104,7 @@ def handle_vote_event(event):
     # Parse the event data and write to the database
     block = event.blockNumber
     timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
     txn_hash = event.transactionHash.hex()
     # Inserting data into the PostgreSQL database
     gauge = event['args']['gauge_addr']

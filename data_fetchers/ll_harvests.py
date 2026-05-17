@@ -5,7 +5,7 @@ from sqlalchemy.exc import SQLAlchemyError, IntegrityError
 from psycopg2 import errors
 import time
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 import sys
 import os
 # Add the parent directory of the current file to sys.path
@@ -103,7 +103,7 @@ def handle_harvested_event(address, event):
         profit = event['args']['_value'] / 1e18
     if address == '0x27B5739e22ad9033bcBf192059122d163b60349D':
         profit = event['args']['gain'] / 1e18
-    date_str = datetime.utcfromtimestamp(timestamp).strftime('%Y-%m-%d %H:%M:%S')
+    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
 
     try:
         ins = harvest_table.insert().values(

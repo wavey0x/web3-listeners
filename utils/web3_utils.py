@@ -1,5 +1,5 @@
 from web3 import Web3
-from datetime import datetime
+from datetime import datetime, timezone
 from functools import lru_cache
 import time
 import os
@@ -49,11 +49,11 @@ def get_block_timestamp(web3: Web3, height: int) -> int:
 
 def timestamp_to_date_string(ts: int) -> str:
     """Convert timestamp to date string"""
-    return datetime.utcfromtimestamp(ts).strftime("%m/%d/%Y, %H:%M:%S")
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%m/%d/%Y, %H:%M:%S")
 
 def timestamp_to_string(ts: int) -> str:
     """Convert timestamp to string"""
-    dt = datetime.utcfromtimestamp(ts).strftime("%m/%d/%Y, %H:%M:%S")
+    dt = datetime.fromtimestamp(ts, timezone.utc).strftime("%m/%d/%Y, %H:%M:%S")
     return dt
 
 @lru_cache(maxsize=1000)
