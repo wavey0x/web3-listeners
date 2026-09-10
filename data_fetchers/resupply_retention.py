@@ -1,267 +1,282 @@
-from web3 import Web3
-from sqlalchemy import create_engine, MetaData, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-import time
+"""Exact retention weights with atomic SQLite progress and controlled notifications."""
+
+import argparse
 from datetime import datetime, timezone
-import sys
-import os
-import telebot
-from telebot.apihelper import ApiException
-from dotenv import load_dotenv
-import logging
+from decimal import Decimal, localcontext
 import json
+import logging
+import os
+from pathlib import Path
+import sys
+import time
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from sqlite_store import Store
+import notifications
+
 logger = logging.getLogger(__name__)
-
-# Add the parent directory of the current file to sys.path
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(parent_dir)
-import utils
-from constants import CHAT_IDS
-from schemas.weight_tracker import create_tables
-
-load_dotenv()
-
-# Constants
-WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
-DATABASE_URI = os.getenv('DATABASE_URI')
-TELEGRAM_BOT_KEY = os.getenv('WAVEY_ALERTS_BOT_KEY')
-POLL_INTERVAL = 10  # seconds
-MAX_WIDTH = 400_000  # max blocks to scan per iteration
-MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
-INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
 CONTRACT_ADDRESS = '0xB9415639618e70aBb71A0F4F8bbB2643Bf337892'
 DEPLOYMENT_BLOCK = 22870945
+POLL_INTERVAL = 10
+CHUNK_SIZE = 5000
+STREAM = 'retention'
+COLUMNS = ('user_address','old_weight','new_weight','weight_diff','block','txn_hash','timestamp','date_str','log_index')
 
-# Connect to Ethereum network
-w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI, request_kwargs={'timeout': 60}))
-if not w3.is_connected():
-    raise Exception("Failed to connect to Ethereum node")
 
-# Set up PostgreSQL connection
-engine = create_engine(DATABASE_URI)
-Session = sessionmaker(bind=engine)
-session = Session()
-metadata = MetaData()
+def hex_value(value):
+    return (value if isinstance(value, str) else value.hex()).lower().removeprefix('0x')
 
-# Create tables
-weight_changes_table = create_tables(metadata)
-metadata.create_all(engine)
 
-# Initialize telegram bot
-bot = telebot.TeleBot(TELEGRAM_BOT_KEY)
+def prepare(store):
+    if not store.rehearsal:
+        raise RuntimeError('Prepare retention state before activating the import')
+    def create(connection):
+        notifications.prepare(connection)
+        connection.execute('''CREATE TABLE retention_checkpoint (
+            stream TEXT PRIMARY KEY,chain_id INTEGER NOT NULL,initial_block INTEGER NOT NULL,
+            next_block INTEGER NOT NULL,previous_hash TEXT NOT NULL,CHECK(next_block>=initial_block))''')
+        connection.execute('CREATE TABLE retention_events (event_key TEXT PRIMARY KEY,block INTEGER NOT NULL)')
+        connection.execute("INSERT INTO _migration_meta VALUES ('retention_schema_version','1')")
+    store.write(create)
 
-# Load ABI - we'll need to create a minimal ABI for the WeightSet event
-weight_tracker_abi = json.load(open('abis/retention.json'))
 
-# Initialize contract
-contract = w3.eth.contract(address=CONTRACT_ADDRESS, abi=weight_tracker_abi)
+def checkpoint(connection):
+    version = connection.execute("SELECT value FROM _migration_meta WHERE key='retention_schema_version'").fetchone()
+    if version is None or version[0] != '1':
+        raise RuntimeError('Retention schema has not been explicitly prepared')
+    row = connection.execute('SELECT * FROM retention_checkpoint WHERE stream=?', (STREAM,)).fetchone()
+    if row is None:
+        raise RuntimeError('Retention checkpoint missing; boundary adoption is required')
+    return dict(row)
 
-# Get original total supply (1 block after deployment)
-def get_original_total_supply():
-    """Get the total supply 1 block after contract deployment"""
-    try:
-        # Call totalSupply at deployment block + 1
-        original_supply = contract.functions.totalSupply().call(block_identifier=DEPLOYMENT_BLOCK + 1)
-        original_supply_eth = original_supply / 10**18
-        logger.info(f"Original total supply: {original_supply_eth:,.2f}")
-        return original_supply_eth
-    except Exception as e:
-        logger.error(f"Error getting original total supply: {str(e)}")
-        return None
-
-# Get original total supply
-original_total_supply = get_original_total_supply()
 
 def format_address(address):
-    """Format an address as 0x123...456 with an Etherscan link."""
-    return f"[0x{address[2:5]}...{address[-4:]}](https://etherscan.io/address/{address})"
+    return f'[0x{address[2:5]}...{address[-4:]}](https://etherscan.io/address/{address})'
 
-def get_last_block_written():
-    try:
-        with engine.connect() as conn:
-            # Get highest block from weight_changes table
-            query = select(weight_changes_table.c.block).order_by(weight_changes_table.c.block.desc()).limit(1)
-            result = conn.execute(query).scalar()
-            
-            # If no records exist, start from deployment block
-            if result is None:
-                return DEPLOYMENT_BLOCK
-            
-            return result
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in get_last_block_written: {str(e)}")
-        raise  # Re-raise to prevent silent failures
 
-def send_alert(chat_id, msg):
-    """Send a Telegram alert with retry logic for rate limiting."""
-    retry_count = 0
-    retry_delay = INITIAL_RETRY_DELAY
-    
-    while retry_count < MAX_TELEGRAM_RETRIES:
-        try:
-            bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview=True)
-            logger.info(f"Successfully sent Telegram message to {chat_id}\n{msg}")
-            return  # Success, exit the function
-        except ApiException as e:
-            if e.error_code == 429:  # Rate limit error
-                retry_after = int(e.description.split('retry after ')[-1])
-                logger.warning(f"Telegram rate limit hit. Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                retry_count += 1
-            else:
-                logger.error(f"Telegram API error: {str(e)}")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-                retry_count += 1
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {str(e)}")
-            time.sleep(retry_delay)
-            retry_delay *= 2  # Exponential backoff
-            retry_count += 1
-    
-    if retry_count >= MAX_TELEGRAM_RETRIES:
-        logger.error(f"Failed to send Telegram message after {MAX_TELEGRAM_RETRIES} retries")
-        logger.error(f"Message was: {msg}")
-
-def handle_weight_set(event):
-    """Handle WeightSet event"""
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    log_index = event.logIndex
-    
-    user_address = event['args']['user']
-    old_weight = event['args']['oldWeight']
-    new_weight = event['args']['newWeight']
-    weight_diff = new_weight - old_weight
-    
-    # Convert from wei to ether (divide by 1e18)
-    old_weight_eth = old_weight / 10**18
-    new_weight_eth = new_weight / 10**18
-    weight_diff_eth = weight_diff / 10**18
-    
-    # First, try to insert into database - this must succeed before sending alert
-    try:
-        ins = weight_changes_table.insert().values(
-            user_address=user_address,
-            old_weight=old_weight,
-            new_weight=new_weight,
-            weight_diff=weight_diff,
-            block=block,
-            txn_hash=txn_hash,
-            timestamp=timestamp,
-            date_str=date_str,
-            log_index=log_index
-        )
-        conn = engine.connect()
-        conn.execute(ins)
-        conn.commit()
-    except IntegrityError as e:
-        # Duplicate entry - already processed, skip alert
-        logger.warning(f"Duplicate event skipped (txn: {txn_hash}): {str(e)}")
-        return
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in handle_weight_set: {str(e)}")
-        raise
-    
-    # Only send alert AFTER successful database commit and not from deployment block
-    if block == DEPLOYMENT_BLOCK:
-        return
-    
-    # Get current total supply at this block
-    try:
-        current_total_supply = contract.functions.totalSupply().call(block_identifier=block)
-        current_total_supply_eth = current_total_supply / 10**18
-    except Exception as e:
-        logger.error(f"Error getting current total supply: {str(e)}")
-        current_total_supply_eth = None
-    
-    # Calculate percentages if we have original total supply
-    if original_total_supply and current_total_supply_eth:
-        shares_remaining_pct = (current_total_supply_eth / original_total_supply) * 100
-        shares_withdrawn_pct = ((original_total_supply - current_total_supply_eth) / original_total_supply) * 100
-    else:
-        shares_remaining_pct = None
-        shares_withdrawn_pct = None
-    
-    # Format the weight values for display (in ETH)
-    weight_diff_formatted = f"{abs(weight_diff_eth):,.0f}"
-    new_weight_formatted = f"{new_weight_eth:,.0f}"
-    
-    # Send alert
-    msg = f"🔁 *Retention Shares Checkpointed*\n\n"
-    msg += f"User: {format_address(user_address)}\n"
-    msg += f"Burned: {weight_diff_formatted}\n"
-    msg += f"Remaining: {new_weight_formatted}\n"
-    
-    # Add total supply info with percentages
-    if current_total_supply_eth is not None:
-        msg += f"\nTotal Remaining: {current_total_supply_eth:,.0f}"
-        if shares_remaining_pct is not None:
-            msg += f" ({shares_remaining_pct:.1f}%)\n"
+def message_for(row, original_supply, current_supply):
+    with localcontext() as context:
+        context.prec = 100
+        difference = Decimal(row['weight_diff']).scaleb(-18)
+        remaining = Decimal(row['new_weight']).scaleb(-18)
+        message = '🔁 *Retention Shares Checkpointed*\n\n'
+        message += f"User: {format_address(row['user_address'])}\nBurned: {abs(difference):,.0f}\nRemaining: {remaining:,.0f}\n"
+        if current_supply is None:
+            message += 'Total Remaining: Unable to fetch\n'
         else:
-            msg += "\n"
-        
-        if shares_withdrawn_pct is not None:
-            msg += f"Total Withdrawn: {original_total_supply - current_total_supply_eth:,.0f} ({shares_withdrawn_pct:.1f}%)\n"
-    else:
-        msg += f"Total Remaining: Unable to fetch\n"
-    
-    msg += f"\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})"
-    
-    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+            current = Decimal(current_supply).scaleb(-18)
+            message += f'\nTotal Remaining: {current:,.0f}'
+            if original_supply and current_supply:
+                original = Decimal(original_supply).scaleb(-18)
+                remaining_pct = current / original * 100
+                withdrawn_pct = (original - current) / original * 100
+                message += f' ({remaining_pct:.1f}%)\nTotal Withdrawn: {original-current:,.0f} ({withdrawn_pct:.1f}%)\n'
+            else:
+                message += '\n'
+        return message + f"\n🔗 [View on Etherscan](https://etherscan.io/tx/{row['txn_hash']})"
 
-def fetch_logs(contract, event_name, from_block, to_block):
+
+def optional_supply(contract, block):
     try:
-        event = getattr(contract.events, event_name)
-        
-        logs = event.get_logs(
-            fromBlock=from_block,
-            toBlock=to_block
-        )
-        return logs
-    except Exception as e:
-        logger.error(f"Error fetching logs for {event_name}: {str(e)}")
-        raise
+        return contract.functions.totalSupply().call(block_identifier=block)
+    except Exception:
+        # Supply is an ancillary display field; the original listener also allowed it to be unavailable.
+        logger.warning('Retention total supply is unavailable for block %s', block)
+        return None
+
+
+def collect(w3, contract, start, end, *, original_supply=None, include_messages=True):
+    end_hash = hex_value(w3.eth.get_block(end)['hash'])
+    logs = contract.events.WeightSet.get_logs(fromBlock=start, toBlock=end)
+    blocks, receipts, supplies, items = {}, {}, {}, []
+    for log in sorted(logs, key=lambda item: (item['blockNumber'], item['logIndex'])):
+        number = log['blockNumber']
+        if (not start <= number <= end or log.get('removed', False)
+                or hex_value(log['address']) != hex_value(CONTRACT_ADDRESS)):
+            raise RuntimeError('RPC returned an invalid retention event')
+        if number not in blocks:
+            blocks[number] = w3.eth.get_block(number)
+        block = blocks[number]
+        if hex_value(block['hash']) != hex_value(log['blockHash']):
+            raise RuntimeError('Retention event block changed during collection')
+        tx = hex_value(log['transactionHash'])
+        if tx not in receipts:
+            receipts[tx] = w3.eth.get_transaction_receipt(log['transactionHash'])
+        receipt = receipts[tx]
+        if hex_value(receipt['blockHash']) != hex_value(log['blockHash']) or hex_value(receipt['transactionHash']) != tx:
+            raise RuntimeError('Retention receipt changed during collection')
+        positions = [i for i, item in enumerate(receipt['logs']) if item['logIndex'] == log['logIndex']
+                     and hex_value(item['address']) == hex_value(CONTRACT_ADDRESS)]
+        if len(positions) != 1:
+            raise RuntimeError('Retention event is missing or ambiguous in its receipt')
+        old, new = int(log['args']['oldWeight']), int(log['args']['newWeight'])
+        row = dict(zip(COLUMNS, (log['args']['user'],str(old),str(new),str(new-old),number,
+            log['transactionHash'].hex(),block['timestamp'],
+            datetime.fromtimestamp(block['timestamp'],timezone.utc).strftime('%Y-%m-%d %H:%M UTC'),log['logIndex'])))
+        message = None
+        if include_messages and number != DEPLOYMENT_BLOCK:
+            if number not in supplies:
+                supplies[number] = optional_supply(contract, number)
+            message = message_for(row, original_supply, supplies[number])
+        items.append(dict(key=f'1:{CONTRACT_ADDRESS.lower()}:{tx}:{positions[0]}',row=row,message=message))
+    if hex_value(w3.eth.get_block(end)['hash']) != end_hash:
+        raise RuntimeError('Retention range changed during collection')
+    return items, end_hash
+
+
+def insert_row(connection, row):
+    return bool(connection.execute('INSERT INTO weight_changes (' + ','.join(COLUMNS) + ') VALUES (' +
+        ','.join('?' for _ in COLUMNS) + ') ON CONFLICT(txn_hash,log_index) DO NOTHING',
+        tuple(row[key] for key in COLUMNS)).rowcount)
+
+
+def matches_import(row, item):
+    candidate = item['row']
+    return (all(hex_value(row[key]) == hex_value(candidate[key]) for key in ('user_address','txn_hash'))
+            and all(int(row[key]) == int(candidate[key]) for key in ('old_weight','new_weight','weight_diff'))
+            and all(row[key] == candidate[key] for key in ('block','timestamp','date_str'))
+            and (row['log_index'] is None or row['log_index'] == candidate['log_index']))
+
+
+def adopt_boundary(store, w3, contract):
+    if not store.rehearsal or w3.eth.chain_id != 1:
+        raise RuntimeError('Adopt retention state in an inactive mainnet import')
+    rows = store.read(lambda connection: [dict(row) for row in connection.execute(
+        'SELECT * FROM weight_changes WHERE block=(SELECT max(block) FROM weight_changes) ORDER BY id')])
+    boundary = rows[0]['block'] if rows else DEPLOYMENT_BLOCK - 1
+    if boundary > w3.eth.get_block('finalized')['number']:
+        raise RuntimeError('Wait for the retention boundary to become finalized')
+    items, block_hash = collect(w3, contract, boundary, boundary, include_messages=False)
+    unmatched = set(range(len(items)))
+    duplicates = 0
+    for row in rows:
+        candidates = [i for i, item in enumerate(items) if matches_import(row, item)]
+        if not candidates:
+            raise RuntimeError('Imported retention boundary does not match chain data; reconciliation required')
+        available = [i for i in candidates if i in unmatched]
+        if available:
+            unmatched.remove(available[0])
+        else:
+            duplicates += 1
+    def adopt(connection):
+        connection.execute('INSERT INTO retention_checkpoint VALUES (?,?,?,?,?)', (STREAM,1,boundary+1,boundary+1,block_hash))
+        notifications.add_stream(connection, STREAM, boundary, block_hash)
+        for index, item in enumerate(items):
+            connection.execute('INSERT INTO retention_events VALUES (?,?)', (item['key'], boundary))
+            if index in unmatched and not insert_row(connection, item['row']):
+                raise RuntimeError('A missing retention boundary event conflicts with an imported row')
+        return dict(next_block=boundary+1,imported_boundary_rows=len(rows),source_duplicates=duplicates,missing_boundary_events=len(unmatched))
+    return store.write(adopt)
+
+
+def scan_once(store, w3, contract, original_supply, generation, send):
+    previous = store.read(checkpoint)
+    if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
+        raise RuntimeError('Retention checkpoint chain does not match RPC')
+    start = previous['next_block']
+    if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
+        raise RuntimeError('Retention checkpoint block changed; reconciliation required')
+    height = w3.eth.get_block('finalized')['number']
+    if start > height:
+        return False
+    end = min(start+CHUNK_SIZE-1,height)
+    items, block_hash = collect(w3, contract, start, end, original_supply=original_supply)
+    if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
+        raise RuntimeError('Retention checkpoint block changed during collection')
+    def commit(connection):
+        if checkpoint(connection) != previous or notifications.state(connection, STREAM)['generation'] != generation:
+            raise RuntimeError('Retention checkpoint or scan session advanced concurrently')
+        claims = []
+        for item in items:
+            if not connection.execute('INSERT INTO retention_events VALUES (?,?) ON CONFLICT(event_key) DO NOTHING',
+                                      (item['key'],item['row']['block'])).rowcount:
+                continue
+            if not insert_row(connection,item['row']):
+                continue  # Preserve the existing return on a duplicate transaction/log.
+            if item['message'] is not None:
+                claim = notifications.decide(connection,STREAM,generation,item['key'],item['row']['block'],
+                                             'weight-change','RESUPPLY_ALERTS',item['message'])
+                if claim:
+                    claims.append((claim,item['message']))
+        connection.execute('UPDATE retention_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
+        return claims
+    for claim, message in store.write(commit):
+        notifications.dispatch(store,claim,message,send)
+    return True
+
+
+def enable_future_alerts(store,w3):
+    finalized = w3.eth.get_block('finalized')['number']
+    previous = store.read(checkpoint)
+    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= finalized
+            or hex_value(w3.eth.get_block(previous['next_block']-1)['hash']) != previous['previous_hash']):
+        raise RuntimeError('Retention must finish validated silent catch-up before enabling alerts')
+    latest = w3.eth.get_block('latest')
+    def enable(connection):
+        if checkpoint(connection)['next_block'] <= finalized:
+            raise RuntimeError('Retention catch-up changed before activation')
+        notifications.enable(connection,STREAM,latest['number'],hex_value(latest['hash']))
+    store.write(enable)
+
+
+def runtime():
+    from web3 import Web3
+    w3 = Web3(Web3.HTTPProvider(os.environ['WEB3_PROVIDER_URI'],request_kwargs={'timeout':60}))
+    abi = json.loads((Path(__file__).resolve().parents[1]/'abis'/'retention.json').read_text())
+    return w3,w3.eth.contract(address=CONTRACT_ADDRESS,abi=abi)
+
+
+def run(store,w3,contract,*,once=False):
+    if w3.eth.chain_id != 1:
+        raise RuntimeError('Retention notifications require Ethereum mainnet')
+    original = optional_supply(contract,DEPLOYMENT_BLOCK+1)
+    latest = w3.eth.get_block('latest')
+    generation = notifications.start_session(store,STREAM,latest['number'],hex_value(latest['hash']))
+    while True:
+        progressed = scan_once(store,w3,contract,original,generation,notifications.send_telegram)
+        if once:
+            return
+        if not progressed:
+            time.sleep(POLL_INTERVAL)
+
 
 def main():
-    logger.info(f"Starting weight tracker for contract {CONTRACT_ADDRESS}")
-    logger.info(f"Monitoring from block {DEPLOYMENT_BLOCK}")
-    
-    i = 0
-    while True:
-        try:
-            i += 1            
-            height = w3.eth.get_block_number()
-            last_block_written = get_last_block_written() + 1
-            to_block = min(last_block_written + MAX_WIDTH, height)
-            
-            if i % 1000 == 0:
-                logger.info(f"Loops since startup: {i}")
-                logger.info(f'Listening from block {last_block_written} --> {to_block}')
-            
-            # Process WeightSet events
-            try:
-                logs = fetch_logs(contract, 'WeightSet', last_block_written, to_block)
-                for log in logs:
-                    handle_weight_set(log)
-                    
-            except Exception as e:
-                logger.error(f"Error processing WeightSet events: {str(e)}")
-            
-        except Exception as e:
-            logger.error(f"Error in main loop: {str(e)}")
-        
-        time.sleep(POLL_INTERVAL)
+    # The bundle calls this function directly; only standalone CLI use parses argv.
+    from dotenv import load_dotenv
+    load_dotenv()
+    store = Store.from_env()
+    w3,contract = runtime()
+    run(store,w3,contract)
+
+
+def cli():
+    parser = argparse.ArgumentParser(description=__doc__)
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--prepare-import',action='store_true')
+    group.add_argument('--adopt-boundary',action='store_true')
+    group.add_argument('--enable-alerts',action='store_true')
+    group.add_argument('--mute-alerts',action='store_true')
+    parser.add_argument('--once',action='store_true')
+    args = parser.parse_args()
+    from dotenv import load_dotenv
+    load_dotenv()
+    store = Store(os.environ['YEARN_DB_PATH'],os.environ['YEARN_IMPORT_SHA256'],rehearsal=args.prepare_import or args.adopt_boundary)
+    if args.prepare_import:
+        prepare(store)
+        return
+    if args.mute_alerts:
+        store.write(lambda connection:notifications.mute(connection,STREAM))
+        return
+    w3,contract = runtime()
+    if args.adopt_boundary:
+        print(json.dumps(adopt_boundary(store,w3,contract)))
+    elif args.enable_alerts:
+        notifications.require_permission(STREAM)
+        enable_future_alerts(store,w3)
+    else:
+        run(store,w3,contract,once=args.once)
+
 
 if __name__ == '__main__':
-    main() 
+    cli()

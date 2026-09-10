@@ -1,6 +1,6 @@
 # SQLite migration
 
-Status: harvest and Curve implementations, isolated tests, and actual-data rehearsals passed; production cutover remains pending. Resupply still requires its four worker ports and notification safeguards. Do not deploy this branch as a complete replacement for the running listener bundle yet.
+Status: harvest, Curve, and retention implementations, isolated tests, and actual-data rehearsals passed; production cutover remains pending. Resupply still requires its DAO and two incentive worker ports. Do not deploy this branch as a complete replacement for the running listener bundle yet.
 
 The shared [migration plan](https://gist.wavey.info/RsZwJygIE49CML9UeqHdTn0l) and `server-backup` repository own the source export, baseline verification, shared database activation, and deployment sequence. All services must move to the same final frozen import. Never run SQLite writers while the public API still reads the older PostgreSQL copy.
 
@@ -54,3 +54,13 @@ Public transport additionally requires a machine-local activation file at `/var/
 During the coordinated cutover, keep the shared alert flag and stream disabled until validation passes. After silent catch-up, the activation procedure creates the root-controlled file, enables shared notification eligibility, and invokes `--enable-alerts`. That command requires a validated scan through the current finalized head and sets a new floor at the latest head, so events already present at activation are ineligible even if they have not finalized yet. Future eligible events may be announced after finalization. `--mute-alerts` disables the stream and invalidates its current session. A machine-level hold must also remove its activation file and stop the service and its activation sources; removing a file does not terminate an already running process or undo a request already in flight.
 
 The 10 September Curve rehearsal retained all **49,742** imported votes exactly, adopted the checked boundary, and stored **two** newer votes with **zero** transport calls. Integrity passed, and Wavey API returned both new records with the expected amounts and metadata. The listener suite now has **33** passing tests covering the harvest and Curve paths, including notification failure/restart behavior and the machine permission guard. Linux application tests, combined workload checks, the final frozen import, and production activation still remain.
+
+## Retention weights
+
+Run `--prepare-import` and then `--adopt-boundary` on `data_fetchers/resupply_retention.py` against the inactive import. Adoption checks every source record in its last stored block against finalized chain events. It retains existing records, including legacy null log indexes and duplicate rows, and inserts only confirmed missing events. Unmatched source data stops adoption.
+
+Raw old/new weights and their signed difference remain exact integer text, preserving the source's 78-digit capacity. Arithmetic uses Python integers and decimal formatting. Data, stable event identities, notification decisions, and the next block commit together. Completed empty ranges are retained; catch-up proceeds in bounded ranges without sleeping between them. The existing deployment-block notification exclusion and optional total-supply display remain.
+
+The `retention` stream uses the same durable suppression, latest-head startup floor, and single-attempt transport as Curve, retaining the `RESUPPLY_ALERTS` destination. Its root-controlled activation file is `retention.allow`. Standalone `--enable-alerts` requires validated silent catch-up through the finalized head; `--mute-alerts` invalidates the session. The bundle's `main()` entry point performs no argument parsing, and imports perform no database, RPC, or notification work.
+
+The 10 September rehearsal retained all **169** imported weight records exactly, validated the boundary, completed a further 5,000-block range, and passed integrity checking with **zero** transport calls. The listener suite now has **45** passing tests. Retention coverage includes 77-digit values and negative differences, atomic failure, legacy duplicates, silent outage recovery, uncertain delivery without replay, and activation boundaries. Production cutover remains pending.
