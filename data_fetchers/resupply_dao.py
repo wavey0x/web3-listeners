@@ -1,758 +1,462 @@
-from web3 import Web3
-from sqlalchemy import create_engine, MetaData, select, and_
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-import time
-from datetime import datetime, UTC
-import sys
+"""SQLite DAO events, quiet state adoption, and durable public-notification decisions."""
+
+import argparse
+from datetime import datetime, timezone
+import json
+import math
 import os
-import telebot
-from telebot.apihelper import ApiException
-from dotenv import load_dotenv
-import logging
+from pathlib import Path
+import sys
+import time
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-logger = logging.getLogger(__name__)
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
+from sqlite_store import Store
+import notifications
 
-# Add the parent directory of the current file to sys.path
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(parent_dir)
-import utils
-from constants import CHAT_IDS
-from schemas.resupply_dao import create_tables, ProposalStatus
-
-load_dotenv()
-
-# Constants
-WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
-DATABASE_URI = os.getenv('DATABASE_URI')
-TELEGRAM_BOT_KEY = os.getenv('WAVEY_ALERTS_BOT_KEY')
-POLL_INTERVAL = 10  # seconds
-MAX_WIDTH = 500_000  # max blocks to scan per iteration
-EXECUTION_DELAY = 60 * 60 * 24  # 24 hours in seconds
-EXECUTION_DEADLINE = 21 * 24 * 60 * 60  # 3 weeks in seconds
-MAX_TELEGRAM_RETRIES = 5  # Maximum number of retries for Telegram API
-INITIAL_RETRY_DELAY = 1  # Initial retry delay in seconds
-VOTING_PERIOD = 60 * 60 * 24 * 7  # 7 days
+POLL_INTERVAL = 10
+EXECUTION_DELAY = 60 * 60 * 24
+EXECUTION_DEADLINE = 21 * 24 * 60 * 60
+VOTING_PERIOD = 60 * 60 * 24 * 7
 DAY_IN_SECONDS = 24 * 60 * 60
-VOTE_ALERT_POWER_THRESHOLD = 1_000_000
-PERMASTAKERS = {
-    '0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn',
-    '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901': 'Convex',
-}
-# Known voter addresses
-VOTER_ADDRESSES = [
-    # '0x11111111084a560ea5755Ed904a57e5411888C28',
-    # '0x11111111408bd67B92C4f74B9D3cF96f1fa412BC',
-    '0x11111111063874cE8dC6232cb5C1C849359476E6',
-]
+VOTE_ALERT_POWER_THRESHOLD = 1000000
+PERMASTAKERS = {'0x12341234B35c8a48908c716266db79CAeA0100E8': 'Yearn', '0xCCCCCccc94bFeCDd365b4Ee6B86108fC91848901': 'Convex'}
+VOTER_ADDRESSES = ['0x11111111063874cE8dC6232cb5C1C849359476E6']
 
-# Connect to Ethereum network
-w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI, request_kwargs={'timeout': 60}))
-if not w3.is_connected():
-    raise Exception("Failed to connect to Ethereum node")
+STREAM = 'dao'
+CHUNK_SIZE = 5000
+INITIAL_BLOCK = 22_200_001
+REGISTRY = '0x10101010E0C3171D894B71B3400668aF311e7D94'
+EVENTS = ('ProposalCreated','VoteCast','ProposalCancelled','ProposalExecuted','ProposalDescriptionUpdated')
+TERMINAL = ('cancelled','executed','failed','expired')
 
-# Set up PostgreSQL connection
-engine = create_engine(DATABASE_URI)
-Session = sessionmaker(bind=engine)
-session = Session()
-metadata = MetaData()
 
-# Create tables
-proposals_table, votes_table, scanner_progress_table = create_tables(metadata)
-metadata.create_all(engine)
+def hex_value(value):
+    return (value if isinstance(value,str) else value.hex()).lower().removeprefix('0x')
 
-# Initialize telegram bot
-bot = telebot.TeleBot(TELEGRAM_BOT_KEY)
 
-# Load ABI
-voter_abi = utils.load_abi('./abis/resupply_voter.json')
+def date_string(timestamp):
+    return datetime.fromtimestamp(timestamp,timezone.utc).strftime('%Y-%m-%d %H:%M UTC')
+
+
+def prepare(store):
+    if not store.rehearsal:
+        raise RuntimeError('Prepare DAO state in an inactive import')
+    def create(c):
+        notifications.prepare(c)
+        c.execute('''CREATE TABLE dao_checkpoint (
+            stream TEXT PRIMARY KEY,chain_id INTEGER NOT NULL,contracts TEXT NOT NULL,
+            initial_block INTEGER NOT NULL,next_block INTEGER NOT NULL,previous_hash TEXT NOT NULL,
+            CHECK(next_block>=initial_block))''')
+        c.execute('''CREATE TABLE dao_events (
+            event_key TEXT PRIMARY KEY,voter_address TEXT NOT NULL,proposal_id TEXT NOT NULL,
+            event_name TEXT NOT NULL,block INTEGER NOT NULL)''')
+        c.execute('''CREATE TABLE dao_poll_state (
+            voter_address TEXT NOT NULL,proposal_id TEXT NOT NULL,status TEXT NOT NULL,
+            reminder_consumed INTEGER NOT NULL CHECK(reminder_consumed IN (0,1)),observed_at INTEGER NOT NULL,
+            PRIMARY KEY(voter_address,proposal_id))''')
+        c.execute('''CREATE TABLE dao_poll_checkpoint (
+            stream TEXT PRIMARY KEY,generation INTEGER NOT NULL,block INTEGER NOT NULL,
+            block_hash TEXT NOT NULL,observed_at INTEGER NOT NULL)''')
+        c.execute("INSERT INTO _migration_meta VALUES ('dao_schema_version','1')")
+    store.write(create)
+
+
+def checkpoint(c):
+    version=c.execute("SELECT value FROM _migration_meta WHERE key='dao_schema_version'").fetchone()
+    if version is None or version[0]!='1':
+        raise RuntimeError('DAO schema has not been explicitly prepared')
+    row=c.execute('SELECT * FROM dao_checkpoint WHERE stream=?',(STREAM,)).fetchone()
+    if row is None:
+        raise RuntimeError('DAO checkpoint missing; boundary adoption is required')
+    return dict(row)
+
+
+def contract_identity(contracts):
+    return json.dumps(sorted(address.lower() for address in contracts))
+
+
+def collect(w3,contracts,start,end):
+    end_hash=hex_value(w3.eth.get_block(end)['hash'])
+    raw=[]
+    for address,contract in contracts.items():
+        for name in EVENTS:
+            for event in getattr(contract.events,name).get_logs(fromBlock=start,toBlock=end):
+                raw.append((event,name,address,contract))
+    blocks,receipts,descriptions,items={},{},{},[]
+    for event,name,address,contract in sorted(raw,key=lambda value:(value[0]['blockNumber'],value[0]['logIndex'])):
+        number=event['blockNumber']
+        if not start<=number<=end or event.get('removed',False) or hex_value(event['address'])!=hex_value(address):
+            raise RuntimeError('RPC returned an invalid DAO event')
+        if number not in blocks:
+            blocks[number]=w3.eth.get_block(number)
+        block=blocks[number]
+        if hex_value(block['hash'])!=hex_value(event['blockHash']):
+            raise RuntimeError('DAO event block changed during collection')
+        tx=hex_value(event['transactionHash'])
+        if tx not in receipts:
+            receipts[tx]=w3.eth.get_transaction_receipt(event['transactionHash'])
+        receipt=receipts[tx]
+        if hex_value(receipt['blockHash'])!=hex_value(event['blockHash']) or hex_value(receipt['transactionHash'])!=tx:
+            raise RuntimeError('DAO receipt changed during collection')
+        positions=[i for i,log in enumerate(receipt['logs']) if log['logIndex']==event['logIndex']
+                   and hex_value(log['address'])==hex_value(address)]
+        if len(positions)!=1:
+            raise RuntimeError('DAO event is missing or ambiguous in its receipt')
+        proposal=str(event['args']['id'] if name in ('ProposalCreated','VoteCast') else event['args']['proposalId'])
+        description_key=(address,proposal,number)
+        if description_key not in descriptions:
+            descriptions[description_key]=contract.functions.proposalDescription(int(proposal)).call(block_identifier=number)
+        # A description event carries the value at its own log position, even if updated twice in a block.
+        description=event['args']['description'] if name=='ProposalDescriptionUpdated' else descriptions[description_key]
+        items.append(dict(key=f'1:{address.lower()}:{tx}:{positions[0]}',event=event,name=name,address=address,
+                          proposal=proposal,block=block,description=description))
+    if hex_value(w3.eth.get_block(end)['hash'])!=end_hash:
+        raise RuntimeError('DAO range changed during collection')
+    return items,end_hash
+
+
+def proposal_row(c,address,proposal):
+    row=c.execute('SELECT * FROM resupply_proposals WHERE lower(voter_address)=? AND proposal_id=?',
+                  (address.lower(),proposal)).fetchone()
+    return dict(row) if row is not None else None
+
+
+def links(row):
+    return (f"\n🔗 [Etherscan](https://etherscan.io/tx/{row['txn_hash']}) | "
+            f"[Resupply](https://resupply.fi/governance/proposals) | "
+            f"[Hippo Army](https://hippo.army/dao/proposal/{int(row['proposal_id'])+9})")
+
 
 def format_address(address):
-    """Format an address as 0x123...456 with an Etherscan link."""
-    return f"[0x{address[2:5]}...{address[-4:]}](https://etherscan.io/address/{address})"
+    return f'[0x{address[2:5]}...{address[-4:]}](https://etherscan.io/address/{address})'
 
-def get_last_block_written():
-    try:
-        with engine.connect() as conn:
-            # First check scanner_progress_table for last scanned block
-            progress_query = select(scanner_progress_table.c.last_scanned_block).order_by(scanner_progress_table.c.id.desc()).limit(1)
-            last_scanned = conn.execute(progress_query).scalar()
-            
-            if last_scanned is not None:
-                return last_scanned + 1
-            
-            # Fallback: Get highest block from proposals table using a subquery
-            proposals_subquery = select(proposals_table.c.block).order_by(proposals_table.c.block.desc()).limit(1).subquery()
-            proposals_query = select(proposals_subquery.c.block)
-            proposals_block = conn.execute(proposals_query).scalar()
-            
-            # Get highest block from votes table using a subquery
-            votes_subquery = select(votes_table.c.block).order_by(votes_table.c.block.desc()).limit(1).subquery()
-            votes_query = select(votes_subquery.c.block)
-            votes_block = conn.execute(votes_query).scalar()
-            
-            # Get the highest block between both tables
-            highest_block = max(
-                block for block in [proposals_block, votes_block] 
-                if block is not None
-            ) if any(block is not None for block in [proposals_block, votes_block]) else 22_200_000
-            
-            return highest_block + 1
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in get_last_block_written: {str(e)}")
-        raise  # Re-raise to prevent silent failures
 
-def update_scanner_progress(block_number):
-    """Update the last scanned block in the database"""
-    try:
-        with engine.connect() as conn:
-            # Insert new progress record
-            ins = scanner_progress_table.insert().values(
-                last_scanned_block=block_number,
-                updated_at=int(time.time())
-            )
-            conn.execute(ins)
-            conn.commit()
-            logger.info(f"Updated scanner progress to block {block_number}")
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in update_scanner_progress: {str(e)}")
-        # Don't raise - we don't want to stop scanning if progress update fails
+def quorum_progress(row):
+    total=row['yes_votes']+row['no_votes']
+    quorum=row['quorum']
+    return (100. if total>=quorum else total/quorum*100, max(quorum-total,0))
 
-def send_alert(chat_id, msg):
-    """Send a Telegram alert with retry logic for rate limiting."""
-    retry_count = 0
-    retry_delay = INITIAL_RETRY_DELAY
-    
-    while retry_count < MAX_TELEGRAM_RETRIES:
-        try:
-            bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview=True)
-            logger.info(f"Successfully sent Telegram message to {chat_id}\n{msg}")
-            return  # Success, exit the function
-        except ApiException as e:
-            if e.error_code == 429:  # Rate limit error
-                retry_after = int(e.description.split('retry after ')[-1])
-                logger.warning(f"Telegram rate limit hit. Waiting {retry_after} seconds...")
-                time.sleep(retry_after)
-                retry_count += 1
+
+def event_message(item,row):
+    name,args=item['name'],item['event']['args']
+    title={'ProposalCreated':'📜 *New Resupply Proposal Created*','VoteCast':'🗳️ *New Vote Cast on Resupply Proposal*',
+           'ProposalCancelled':'❌ *Resupply Proposal Cancelled*','ProposalExecuted':'🚀 *Resupply Proposal Executed*',
+           'ProposalDescriptionUpdated':'📝 *Resupply Proposal Description Updated*'}[name]
+    message=title+f"\n\nProposal {item['proposal']}: {item['description']}\n"
+    if name=='ProposalCreated':
+        message+=f"\nProposer: {format_address(args['account'])}\nEpoch: {args['epoch']}\n"
+        message+=f"Quorum Required: {args['quorumWeight']:,}\nEnds: {date_string(row['end_time'])}\n"
+    elif name=='VoteCast':
+        voter=args['account']
+        message+=f"User: {format_address(voter)}"+(f' ({PERMASTAKERS[voter]})' if voter in PERMASTAKERS else '')+'\n'
+        message+=f"Vote: Yes ({args['weightYes']:,.0f})\n" if args['weightYes']>0 else f"Vote: No ({args['weightNo']:,.0f})\n"
+        percentage,needed=quorum_progress(row)
+        message+=f'Quorum Progress: {percentage:.2f}% | {needed:,.0f} needed\n'
+    return message+links(dict(row,txn_hash=item['event']['transactionHash'].hex()))
+
+
+def apply_event(c,item,used_legacy_votes):
+    """Write one event. A None result means its data was already imported."""
+    event,args,name=item['event'],item['event']['args'],item['name']
+    address,proposal=item['address'],item['proposal']
+    number,timestamp=event['blockNumber'],item['block']['timestamp']
+    tx=event['transactionHash'].hex()
+    row=proposal_row(c,address,proposal)
+    if name=='ProposalCreated':
+        if row is not None:
+            if (hex_value(row['proposer'])!=hex_value(args['account']) or row['start_time']!=timestamp
+                    or row['quorum']!=args['quorumWeight']):
+                raise RuntimeError('Imported DAO proposal does not match its creation event')
+            return None
+        c.execute('''INSERT INTO resupply_proposals
+            (proposal_id,voter_address,proposer,description,start_time,end_time,status,yes_votes,no_votes,quorum,
+             block,txn_hash,timestamp,date_str,last_updated,ending_soon_alert_sent)
+            VALUES (?,?,?,?,?,?,'open',0,0,?,?,?,?,?,?,0)''',
+            (proposal,address,args['account'],item['description'],timestamp,timestamp+VOTING_PERIOD,args['quorumWeight'],
+             number,tx,timestamp,date_string(timestamp),number))
+    elif name=='VoteCast':
+        weight=float(args['weightYes'] if args['weightYes']>0 else args['weightNo'])
+        if not math.isfinite(weight):
+            raise ValueError('Non-finite DAO vote weight')
+        existing=c.execute('''SELECT * FROM resupply_votes WHERE lower(replace(txn_hash,'0x',''))=?
+            AND (log_index=? OR log_index IS NULL) ORDER BY log_index IS NULL,id''',
+            (hex_value(tx),event['logIndex'])).fetchall()
+        for vote in existing:
+            if vote['id'] in used_legacy_votes:
+                continue
+            matches=(vote['proposal_id']==proposal and hex_value(vote['voter'])==hex_value(args['account'])
+                and vote['block']==number and vote['timestamp']==timestamp
+                and bool(vote['support'])==(args['weightYes']>0) and vote['weight']==weight)
+            if matches:
+                if vote['log_index'] is None:
+                    used_legacy_votes.add(vote['id'])
+                return None
+            if vote['log_index'] is not None:
+                raise RuntimeError('Imported DAO vote conflicts with its chain event')
+        if row is None:
+            raise RuntimeError('DAO vote has no saved proposal; reconciliation required')
+        c.execute('''INSERT INTO resupply_votes
+            (proposal_id,voter,support,weight,reason,block,txn_hash,timestamp,date_str,log_index)
+            VALUES (?,?,?,?,'',?,?,?,?,?)''',
+            (proposal,args['account'],int(args['weightYes']>0),weight,number,tx,timestamp,date_string(timestamp),event['logIndex']))
+        c.execute('UPDATE resupply_proposals SET yes_votes=yes_votes+?,no_votes=no_votes+?,last_updated=? WHERE id=?',
+                  (float(args['weightYes']),float(args['weightNo']),number,row['id']))
+        if args['weightYes']+args['weightNo']<VOTE_ALERT_POWER_THRESHOLD:
+            return None
+    else:
+        if row is None:
+            raise RuntimeError('DAO update has no saved proposal; reconciliation required')
+        if row['block']>number:
+            return None  # A partially completed source scan already recorded a later update.
+        values=dict(block=number,txn_hash=tx,timestamp=timestamp,date_str=date_string(timestamp),last_updated=number)
+        if name=='ProposalCancelled':
+            values['status']='cancelled'
+        elif name=='ProposalExecuted':
+            values.update(status='executed',execution_time=timestamp)
+        else:
+            values['description']=item['description']
+        c.execute('UPDATE resupply_proposals SET '+','.join(key+'=?' for key in values)+' WHERE id=?',(*values.values(),row['id']))
+    return event_message(item,proposal_row(c,address,proposal))
+
+
+def record_events(c,items,generation=None):
+    claims=[]
+    used_legacy_votes=set()
+    for item in items:
+        inserted=c.execute('INSERT INTO dao_events VALUES (?,?,?,?,?) ON CONFLICT(event_key) DO NOTHING',
+            (item['key'],item['address'],item['proposal'],item['name'],item['event']['blockNumber'])).rowcount
+        if not inserted:
+            continue
+        message=apply_event(c,item,used_legacy_votes)
+        if message is not None and generation is not None:
+            claim=notifications.decide(c,STREAM,generation,item['key'],item['event']['blockNumber'],item['name'],'RESUPPLY_ALERTS',message)
+            if claim:
+                claims.append((claim,message))
+    return claims
+
+
+def adopt_boundary(store,w3,contracts):
+    if not store.rehearsal or w3.eth.chain_id!=1:
+        raise RuntimeError('Adopt DAO state in an inactive mainnet import')
+    def boundary(c):
+        row=c.execute('SELECT last_scanned_block FROM resupply_scanner_progress ORDER BY id DESC LIMIT 1').fetchone()
+        if row is not None:
+            return row[0],'latest-scanner-record'
+        bounds=[c.execute(f'SELECT max(block) FROM {table}').fetchone()[0] for table in ('resupply_proposals','resupply_votes')]
+        return max([value for value in bounds if value is not None],default=INITIAL_BLOCK-1),'explicit-legacy-fallback'
+    number,source=store.read(boundary)
+    if number>w3.eth.get_block('finalized')['number']:
+        raise RuntimeError('Wait for the DAO boundary to become finalized')
+    items,block_hash=collect(w3,contracts,number,number)
+    def adopt(c):
+        c.execute('INSERT INTO dao_checkpoint VALUES (?,?,?,?,?,?)',
+                  (STREAM,1,contract_identity(contracts),number+1,number+1,block_hash))
+        notifications.add_stream(c,STREAM,number,block_hash)
+        record_events(c,items)
+        return dict(next_block=number+1,boundary_source=source,boundary_events=len(items))
+    return store.write(adopt)
+
+
+def scan_once(store,w3,contracts,generation,send):
+    previous=store.read(checkpoint)
+    if w3.eth.chain_id!=1 or previous['chain_id']!=1 or previous['contracts']!=contract_identity(contracts):
+        raise RuntimeError('DAO chain or voter contracts differ from the adopted checkpoint')
+    start=previous['next_block']
+    if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
+        raise RuntimeError('DAO checkpoint block changed; reconciliation required')
+    finalized=w3.eth.get_block('finalized')
+    if start>finalized['number']:
+        return False
+    end=min(start+CHUNK_SIZE-1,finalized['number'])
+    items,block_hash=collect(w3,contracts,start,end)
+    if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
+        raise RuntimeError('DAO checkpoint changed during collection')
+    def commit(c):
+        if checkpoint(c)!=previous or notifications.state(c,STREAM)['generation']!=generation:
+            raise RuntimeError('DAO checkpoint or session advanced concurrently')
+        claims=record_events(c,items,generation)
+        c.execute('UPDATE dao_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',(end+1,block_hash,STREAM))
+        # Preserve the full source history and its established meaning. New rows represent completed ranges.
+        c.execute('INSERT INTO resupply_scanner_progress(last_scanned_block,updated_at) VALUES (?,?)',(end,int(time.time())))
+        return claims
+    for claim,message in store.write(commit):
+        notifications.dispatch(store,claim,message,send)
+    return True
+
+
+def current_status(row,now):
+    if row['status'] in TERMINAL:
+        return row['status']
+    if now<row['end_time']:
+        return 'open'
+    if row['yes_votes']+row['no_votes']<row['quorum'] or row['yes_votes']<=row['no_votes']:
+        return 'failed'
+    if now<row['end_time']+EXECUTION_DELAY:
+        return 'execution_delay'
+    if now<row['end_time']+EXECUTION_DEADLINE:
+        return 'executable'
+    return 'expired'
+
+
+def status_message(row,kind):
+    titles={'ending-soon':'⚠️ *Resupply Proposal Ending Soon*','passed':'✅ *Resupply Proposal Passed*',
+            'failed':'❌ *Resupply Proposal Failed*','executable':'⚡ *Resupply Proposal Ready for Execution*',
+            'expired':'⌛ *Resupply Proposal Expired*'}
+    message=titles[kind]+f"\n\nProposal {row['proposal_id']}: {row['description']}\n"
+    if kind in ('executable','expired'):
+        message+=f"Execution Deadline: {date_string(row['end_time']+EXECUTION_DEADLINE)}\n"
+    else:
+        if kind=='ending-soon':
+            message+=f"\nEnds: {date_string(row['end_time'])}\n"
+        message+=f"Yes: {row['yes_votes']:,.0f}\nNo: {row['no_votes']:,.0f}\n"
+        percentage,needed=quorum_progress(row)
+        message+=f'Quorum: {percentage:.2f}%'+(f' | {needed:,.0f} needed' if kind!='passed' else '')+'\n\n'
+        if kind=='passed':
+            message+='Executable in 24hrs\n'
+    return message+links(row)
+
+
+def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
+    """Advance current state once; startup/activation adopts existing conditions silently."""
+    head=w3.eth.get_block('finalized')
+    latest=w3.eth.get_block('latest') if activate else None
+    chain_id=w3.eth.chain_id
+    now=head['timestamp']
+    def commit(c):
+        previous=checkpoint(c)
+        if chain_id!=1 or previous['chain_id']!=1:
+            raise RuntimeError('DAO polling chain does not match its checkpoint')
+        if previous['next_block']<=head['number']:
+            if activate:
+                raise RuntimeError('DAO must finish silent chain catch-up before activation')
+            return None  # A new finalized block may arrive between the idle scan and this poll.
+        session=notifications.state(c,STREAM)
+        if session['generation']!=generation:
+            raise RuntimeError('DAO polling session changed')
+        saved=c.execute('SELECT * FROM dao_poll_checkpoint WHERE stream=?',(STREAM,)).fetchone()
+        if not baseline and (saved is None or saved['generation']!=generation):
+            raise RuntimeError('DAO polling needs an explicit quiet baseline for this session')
+        if saved is not None and (now<saved['observed_at'] or head['number']<saved['block']):
+            raise RuntimeError('DAO polling head moved backwards; reconciliation required')
+        if previous['next_block']==head['number']+1 and previous['previous_hash']!=hex_value(head['hash']):
+            raise RuntimeError('DAO polling head differs from its indexed checkpoint')
+        claims=[]
+        for record in c.execute('SELECT * FROM resupply_proposals ORDER BY id').fetchall():
+            row=dict(record)
+            address=row['voter_address'].lower()
+            old=c.execute('SELECT * FROM dao_poll_state WHERE voter_address=? AND proposal_id=?',(address,row['proposal_id'])).fetchone()
+            status=current_status(row,now)
+            due=status=='open' and 0<row['end_time']-now<=DAY_IN_SECONDS
+            consumed=bool(row['ending_soon_alert_sent'] or (old and old['reminder_consumed']))
+            kinds=[]
+            if baseline:
+                # The current condition becomes history, including a reminder already due during downtime.
+                consumed=consumed or row['end_time']-DAY_IN_SECONDS<=now
             else:
-                logger.error(f"Telegram API error: {str(e)}")
-                time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
-                retry_count += 1
-        except Exception as e:
-            logger.error(f"Unexpected error sending Telegram message: {str(e)}")
-            time.sleep(retry_delay)
-            retry_delay *= 2  # Exponential backoff
-            retry_count += 1
-    
-    if retry_count >= MAX_TELEGRAM_RETRIES:
-        logger.error(f"Failed to send Telegram message after {MAX_TELEGRAM_RETRIES} retries")
-        logger.error(f"Message was: {msg}")
+                if due and not consumed:
+                    kinds.append('ending-soon')
+                    consumed=True
+                old_status=old['status'] if old is not None else row['status']
+                if status!=old_status:
+                    if status=='execution_delay':
+                        kinds.append('passed')
+                    elif status in ('failed','executable','expired'):
+                        kinds.append(status)
+            if status!=row['status'] or (due and consumed and not row['ending_soon_alert_sent']):
+                c.execute('UPDATE resupply_proposals SET status=?,ending_soon_alert_sent=?,last_updated=? WHERE id=?',
+                    (status,int(bool(row['ending_soon_alert_sent']) or (due and consumed)),now,row['id']))
+            c.execute('''INSERT INTO dao_poll_state VALUES (?,?,?,?,?) ON CONFLICT(voter_address,proposal_id)
+                DO UPDATE SET status=excluded.status,reminder_consumed=excluded.reminder_consumed,observed_at=excluded.observed_at''',
+                (address,row['proposal_id'],status,int(consumed),now))
+            for kind in kinds:
+                message=status_message(row,kind)
+                claim=notifications.decide(c,STREAM,generation,f'proposal:{address}:{row["proposal_id"]}',head['number'],
+                                           kind,'RESUPPLY_ALERTS',message)
+                if claim:
+                    claims.append((claim,message))
+        c.execute('''INSERT INTO dao_poll_checkpoint VALUES (?,?,?,?,?) ON CONFLICT(stream)
+            DO UPDATE SET generation=excluded.generation,block=excluded.block,block_hash=excluded.block_hash,observed_at=excluded.observed_at''',
+            (STREAM,generation,head['number'],hex_value(head['hash']),now))
+        if activate:
+            if not baseline:
+                raise RuntimeError('DAO activation requires quiet state adoption')
+            notifications.enable(c,STREAM,latest['number'],hex_value(latest['hash']))
+        return claims
+    claims=store.write(commit)
+    if claims is None:
+        return False
+    for claim,message in claims:
+        notifications.dispatch(store,claim,message,send)
+    return True
 
-def handle_proposal_created(event, voter_address):
-    logger.info(f"Processing ProposalCreated: proposal_id={event['args']['id']}, voter={voter_address}, block={event.blockNumber}, tx={event.transactionHash.hex()}")
-    
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    
-    proposal_id = int(event['args']['id'])
-    proposer = event['args']['account']
-    start_time = timestamp
-    end_time = timestamp + VOTING_PERIOD
-    
-    logger.info(f"Fetching description for proposal {proposal_id} from voter {voter_address}")
-    description = get_proposal_description(proposal_id, voter_address)
-    logger.info(f"Got description for proposal {proposal_id}: {description[:50] if description else 'empty'}...")
-    
-    # First, try to insert into database - this must succeed before sending alert
-    try:
-        logger.info(f"Attempting to insert proposal {proposal_id} into database")
-        ins = proposals_table.insert().values(
-            proposal_id=proposal_id,
-            voter_address=voter_address,
-            proposer=proposer,
-            description=description,
-            start_time=start_time,
-            end_time=end_time,
-            status=ProposalStatus.OPEN.value,
-            yes_votes=0,
-            no_votes=0,
-            quorum=event['args']['quorumWeight'],
-            block=block,
-            txn_hash=txn_hash,
-            timestamp=timestamp,
-            date_str=date_str,
-            last_updated=block
-        )
-        conn = engine.connect()
-        conn.execute(ins)
-        conn.commit()
-        logger.info(f"Successfully inserted proposal {proposal_id} into database")
-    except IntegrityError as e:
-        # Duplicate entry - already processed, skip alert
-        logger.warning(f"Duplicate proposal skipped (proposal_id: {proposal_id}, voter: {voter_address}): {str(e)}")
-        return
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in handle_proposal_created: {str(e)}")
-        raise
-    
-    # Only send alert AFTER successful database commit
-    logger.info(f"Sending alert for proposal {proposal_id}")
-    msg = f"📜 *New Resupply Proposal Created*\n\n"
-    msg += f"Proposal {proposal_id}: {description}\n\n"
-    msg += f"Proposer: {format_address(proposer)}\n"
-    msg += f"Epoch: {event['args']['epoch']}\n"
-    msg += f"Quorum Required: {event['args']['quorumWeight']:,}\n"
-    msg += f"Ends: {datetime.fromtimestamp(end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-    msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
 
-def get_proposal_description(proposal_id, voter_address):
-    voter_contract = w3.eth.contract(address=voter_address, abi=voter_abi)
-    description = voter_contract.functions.proposalDescription(int(proposal_id)).call()
-    return description
+def runtime():
+    from web3 import Web3
+    w3=Web3(Web3.HTTPProvider(os.environ['WEB3_PROVIDER_URI'],request_kwargs={'timeout':60}))
+    if w3.eth.chain_id!=1:
+        raise RuntimeError('DAO monitoring requires Ethereum mainnet')
+    root=Path(__file__).resolve().parents[1]/'abis'
+    voter_abi=json.loads((root/'resupply_voter.json').read_text())
+    registry=w3.eth.contract(address=REGISTRY,abi=json.loads((root/'resupply_registry.json').read_text()))
+    registered=registry.functions.getAddress('VOTER').call(block_identifier='finalized')
+    addresses=set(VOTER_ADDRESSES)
+    if int(registered,16):
+        addresses.add(registered)
+    return w3,{address:w3.eth.contract(address=address,abi=voter_abi) for address in addresses}
 
-def handle_vote_cast(event, voter_address):
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    log_index = event.logIndex
-    
-    proposal_id = str(event['args']['id'])
-    voter = event['args']['account']
-    weight_yes = event['args']['weightYes']
-    weight_no = event['args']['weightNo']
-    description = ""
-    
-    description = get_proposal_description(proposal_id, voter_address)
-    
-    # First, try to insert into database - this must succeed before sending alert
-    try:
-        with engine.connect() as conn:
-            # Insert vote
-            ins = votes_table.insert().values(
-                proposal_id=proposal_id,
-                voter=voter,
-                support=weight_yes > 0,  # If weightYes > 0, it's a yes vote
-                weight=weight_yes if weight_yes > 0 else weight_no,  # Use the non-zero weight
-                reason='',  # Reason not available in event
-                block=block,
-                txn_hash=txn_hash,
-                timestamp=timestamp,
-                date_str=date_str,
-                log_index=log_index
-            )
-            conn.execute(ins)
-            
-            # Update proposal vote counts and last_updated
-            update = proposals_table.update().where(
-                and_(
-                    proposals_table.c.proposal_id == proposal_id,
-                    proposals_table.c.voter_address == voter_address
-                )
-            ).values(
-                yes_votes=proposals_table.c.yes_votes + weight_yes,
-                no_votes=proposals_table.c.no_votes + weight_no,
-                last_updated=block
-            )
-            
-            result = conn.execute(update)
-            if result.rowcount == 0:
-                logger.warning(f"No proposal found to update for proposal_id {proposal_id} and voter {voter_address}")
-            
-            conn.commit()
-    except IntegrityError as e:
-        # Duplicate entry - already processed, skip alert
-        logger.warning(f"Duplicate vote skipped (txn: {txn_hash}, log_index: {log_index}): {str(e)}")
-        return
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in handle_vote_cast: {str(e)}")
-        raise
-    
-    # Only send alert AFTER successful database commit and only for 1M+ voting power
-    voting_power = weight_yes + weight_no
-    if voting_power < VOTE_ALERT_POWER_THRESHOLD:
-        return
-    
-    voter_name = PERMASTAKERS.get(voter)
-    
-    # Get the quorum value and vote totals for this proposal
-    with engine.connect() as conn:
-        query = select(
-            proposals_table.c.quorum,
-            proposals_table.c.yes_votes,
-            proposals_table.c.no_votes
-        ).where(
-            and_(
-                proposals_table.c.proposal_id == proposal_id,
-                proposals_table.c.voter_address == voter_address
-            )
-        )
-        result = conn.execute(query).first()
-        if result is None:
-            logger.warning(f"No proposal found for proposal_id {proposal_id} and voter {voter_address}")
+
+def run(store,w3,contracts,*,once=False):
+    latest=w3.eth.get_block('latest')
+    generation=notifications.start_session(store,STREAM,latest['number'],hex_value(latest['hash']))
+    baseline_needed=True
+    while True:
+        progressed=scan_once(store,w3,contracts,generation,notifications.send_telegram)
+        # Poll only when all event types and contracts have reached the same finalized head.
+        if not progressed:
+            if poll_statuses(store,w3,generation,notifications.send_telegram,baseline=baseline_needed):
+                baseline_needed=False
+        if once:
             return
-        
-        quorum = result.quorum
-        total_yes = result.yes_votes
-        total_no = result.no_votes
-    
-    # Send alert
-    logger.info(
-        "Sending vote alert for proposal %s by %s with voting power %s",
-        proposal_id,
-        voter,
-        f"{voting_power:,.0f}"
-    )
-    msg = f"🗳️ *New Vote Cast on Resupply Proposal*\n\n"
-    msg += f"Proposal {proposal_id}: {description}\n"
-    if voter_name:
-        msg += f"User: {format_address(voter)} ({voter_name})\n"
-    else:
-        msg += f"User: {format_address(voter)}\n"
-    
-    if weight_yes > 0:
-        msg += f"Vote: Yes ({weight_yes:,.0f})\n"
-    else:
-        msg += f"Vote: No ({weight_no:,.0f})\n"
-    vote_total = total_yes + total_no
-    quorum_pct = 100 if vote_total >= quorum else (vote_total / quorum) * 100
-    votes_needed = 0 if vote_total >= quorum else quorum - vote_total
-    msg += f"Quorum Progress: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n"
-    msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-    
-    send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
+        if not progressed:
+            time.sleep(POLL_INTERVAL)
 
-def handle_proposal_cancelled(event, voter_address):
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    
-    proposal_id = str(event['args']['proposalId'])
-    description = ""
-    
-    try:
-        description = get_proposal_description(proposal_id, voter_address)
-        update = proposals_table.update().where(
-            and_(
-                proposals_table.c.proposal_id == proposal_id,
-                proposals_table.c.voter_address == voter_address
-            )
-        ).values(
-            status=ProposalStatus.CANCELLED.value,
-            block=block,
-            txn_hash=txn_hash,
-            timestamp=timestamp,
-            date_str=date_str,
-            last_updated=block
-        )
-        conn = engine.connect()
-        conn.execute(update)
-        conn.commit()
-        
-        # Send alert
-        msg = f"❌ *Resupply Proposal Cancelled*\n\n"
-        msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-        
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in handle_proposal_cancelled: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_proposal_cancelled: {str(e)}")
-        raise
-
-def handle_proposal_executed(event, voter_address):
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    
-    proposal_id = str(event['args']['proposalId'])
-    description = ""
-    
-    try:
-        description = get_proposal_description(proposal_id, voter_address)
-        
-        update = proposals_table.update().where(
-            and_(
-                proposals_table.c.proposal_id == proposal_id,
-                proposals_table.c.voter_address == voter_address
-            )
-        ).values(
-            status=ProposalStatus.EXECUTED.value,
-            execution_time=timestamp,
-            block=block,
-            txn_hash=txn_hash,
-            timestamp=timestamp,
-            date_str=date_str,
-            last_updated=block
-        )
-        conn = engine.connect()
-        conn.execute(update)
-        conn.commit()
-        
-        # Send alert
-        msg = f"🚀 *Resupply Proposal Executed*\n\n"
-        msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-        
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in handle_proposal_executed: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in handle_proposal_executed: {str(e)}")
-        raise
-
-def handle_proposal_description_updated(event, voter_address):
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, UTC).strftime('%Y-%m-%d %H:%M UTC')
-    txn_hash = event.transactionHash.hex()
-    
-    proposal_id = str(event['args']['proposalId'])
-    description = ""
-    
-    try:
-        description = get_proposal_description(proposal_id, voter_address)
-        
-        update = proposals_table.update().where(
-            and_(
-                proposals_table.c.proposal_id == proposal_id,
-                proposals_table.c.voter_address == voter_address
-            )
-        ).values(
-            description=description,
-            block=block,
-            txn_hash=txn_hash,
-            timestamp=timestamp,
-            date_str=date_str,
-            last_updated=block
-        )
-        conn = engine.connect()
-        conn.execute(update)
-        conn.commit()
-        
-        # Send alert
-        msg = f"📝 *Resupply Proposal Description Updated*\n\n"
-        msg += f"Proposal {proposal_id}: {description}\n"
-        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal_id)})"
-        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-        
-    except SQLAlchemyError as e:
-        logger.error("Database error occurred:", exc_info=True)
-    except Exception as e:
-        logger.error("An error occurred:", exc_info=True)
-
-def check_proposal_statuses():
-    current_time = int(time.time())
-    
-    try:
-        with engine.connect() as conn:
-            # Get all proposals that need status checking
-            query = select(proposals_table).where(
-                proposals_table.c.status.in_([
-                    ProposalStatus.OPEN.value,
-                    ProposalStatus.PASSED.value,
-                    ProposalStatus.EXECUTION_DELAY.value,
-                    ProposalStatus.EXECUTABLE.value
-                ])
-            )
-            proposals = conn.execute(query).fetchall()
-            
-            for proposal in proposals:
-                status = proposal.status
-                # For OPEN proposals, check if they've ended
-                if status == ProposalStatus.OPEN.value:
-                    # Check if proposal is ending in 24 hours and we haven't sent an alert yet
-                    time_remaining = proposal.end_time - current_time
-                    if time_remaining > 0 and time_remaining <= DAY_IN_SECONDS and not proposal.ending_soon_alert_sent:
-                        # Mark that we've sent the alert BEFORE sending to prevent duplicates
-                        update = proposals_table.update().where(
-                            and_(
-                                proposals_table.c.proposal_id == proposal.proposal_id,
-                                proposals_table.c.voter_address == proposal.voter_address
-                            )
-                        ).values(
-                            ending_soon_alert_sent=True,
-                            last_updated=current_time
-                        )
-                        conn.execute(update)
-                        conn.commit()
-                        
-                        # Send alert AFTER successful commit
-                        msg = f"⚠️ *Resupply Proposal Ending Soon*\n\n"
-                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                        msg += f"Ends: {datetime.fromtimestamp(proposal.end_time, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"Yes: {proposal.yes_votes:,.0f}\n"
-                        msg += f"No: {proposal.no_votes:,.0f}\n"
-                        vote_total = proposal.yes_votes + proposal.no_votes
-                        quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                        votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
-                        msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                    
-                    # Check if proposal has ended
-                    if time_remaining <= 0:
-                        quorum_met = proposal.yes_votes + proposal.no_votes >= proposal.quorum
-                        if quorum_met and proposal.yes_votes > proposal.no_votes:
-                            # Proposal passed - update status BEFORE sending alert
-                            status = ProposalStatus.PASSED.value
-                            update = proposals_table.update().where(
-                                and_(
-                                    proposals_table.c.proposal_id == proposal.proposal_id,
-                                    proposals_table.c.voter_address == proposal.voter_address
-                                )
-                            ).values(
-                                status=ProposalStatus.PASSED.value,
-                                last_updated=current_time
-                            )
-                            result = conn.execute(update)
-                            if result.rowcount == 0:
-                                logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
-                                continue  # Skip alert if update failed
-                            conn.commit()
-                            
-                            # Send alert AFTER successful commit
-                            msg = f"✅ *Resupply Proposal Passed*\n\n"
-                            msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                            msg += f"Yes: {proposal.yes_votes:,.0f}\n"
-                            msg += f"No: {proposal.no_votes:,.0f}\n"
-                            vote_total = proposal.yes_votes + proposal.no_votes
-                            quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                            msg += f"Quorum: {quorum_pct:.2f}%\n\n"
-                            msg += f"Executable in 24hrs\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                            send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                        else:
-                            # Proposal failed - update status BEFORE sending alert
-                            update = proposals_table.update().where(
-                                and_(
-                                    proposals_table.c.proposal_id == proposal.proposal_id,
-                                    proposals_table.c.voter_address == proposal.voter_address
-                                )
-                            ).values(
-                                status=ProposalStatus.FAILED.value,
-                                last_updated=current_time
-                            )
-                            result = conn.execute(update)
-                            if result.rowcount == 0:
-                                logger.warning(f"Failed to update status for proposal {proposal.proposal_id} with voter {proposal.voter_address}")
-                                continue  # Skip alert if update failed
-                            conn.commit()
-                            
-                            # Send alert AFTER successful commit
-                            msg = f"❌ *Resupply Proposal Failed*\n\n"
-                            msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n\n"
-                            msg += f"Yes: {proposal.yes_votes:,.0f}\n"
-                            msg += f"No: {proposal.no_votes:,.0f}\n"
-                            vote_total = proposal.yes_votes + proposal.no_votes
-                            quorum_pct = 100 if vote_total >= proposal.quorum else (vote_total / proposal.quorum) * 100
-                            votes_needed = 0 if vote_total >= proposal.quorum else proposal.quorum - vote_total
-                            msg += f"Quorum: {quorum_pct:.2f}% | {votes_needed:,.0f} needed\n\n"
-                            msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                            send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                
-                # For PASSED proposals, check execution status
-                elif status == ProposalStatus.PASSED.value:
-                    time_since_passed = current_time - proposal.end_time
-                    
-                    if time_since_passed < EXECUTION_DELAY:
-                        status = ProposalStatus.EXECUTION_DELAY.value
-                        # In execution delay period
-                        update = proposals_table.update().where(
-                            and_(
-                                proposals_table.c.proposal_id == proposal.proposal_id,
-                                proposals_table.c.voter_address == proposal.voter_address
-                            )
-                        ).values(
-                            status=ProposalStatus.EXECUTION_DELAY.value,
-                            last_updated=current_time
-                        )
-                        conn.execute(update)
-                        conn.commit()
-                    elif time_since_passed < EXECUTION_DEADLINE:
-                        status = ProposalStatus.EXECUTABLE.value
-                
-                # For EXECUTION_DELAY proposals, check if they're ready for execution
-                elif status == ProposalStatus.EXECUTION_DELAY.value:
-                    time_since_passed = current_time - proposal.end_time
-                    
-                    if time_since_passed >= EXECUTION_DELAY and time_since_passed < EXECUTION_DEADLINE:
-                        # Ready for execution - update status BEFORE sending alert
-                        update = proposals_table.update().where(
-                            and_(
-                                proposals_table.c.proposal_id == proposal.proposal_id,
-                                proposals_table.c.voter_address == proposal.voter_address
-                            )
-                        ).values(
-                            status=ProposalStatus.EXECUTABLE.value,
-                            last_updated=current_time
-                        )
-                        result = conn.execute(update)
-                        if result.rowcount == 0:
-                            logger.warning(f"Failed to update status for proposal {proposal.proposal_id}")
-                            continue
-                        conn.commit()
-                        
-                        # Send alert AFTER successful commit
-                        msg = f"⚡ *Resupply Proposal Ready for Execution*\n\n"
-                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
-                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-                
-                # Check for expired proposals (both PASSED and EXECUTION_DELAY)
-                if status in [ProposalStatus.PASSED.value, ProposalStatus.EXECUTION_DELAY.value]:
-                    time_since_passed = current_time - proposal.end_time
-                    if time_since_passed >= EXECUTION_DEADLINE:
-                        # Past execution deadline - update status BEFORE sending alert
-                        update = proposals_table.update().where(
-                            and_(
-                                proposals_table.c.proposal_id == proposal.proposal_id,
-                                proposals_table.c.voter_address == proposal.voter_address
-                            )
-                        ).values(
-                            status=ProposalStatus.EXPIRED.value,
-                            last_updated=current_time
-                        )
-                        result = conn.execute(update)
-                        if result.rowcount == 0:
-                            logger.warning(f"Failed to update status for proposal {proposal.proposal_id}")
-                            continue
-                        conn.commit()
-                        
-                        # Send alert AFTER successful commit
-                        msg = f"⌛ *Resupply Proposal Expired*\n\n"
-                        msg += f"Proposal {proposal.proposal_id}: {proposal.description}\n"
-                        msg += f"Execution Deadline: {datetime.fromtimestamp(proposal.end_time + EXECUTION_DEADLINE, UTC).strftime('%Y-%m-%d %H:%M UTC')}\n"
-                        msg += f"\n🔗 [Etherscan](https://etherscan.io/tx/{proposal.txn_hash}) | [Resupply](https://resupply.fi/governance/proposals) | [Hippo Army](https://hippo.army/dao/proposal/{get_hippo_id(proposal.proposal_id)})"
-                        send_alert(CHAT_IDS['RESUPPLY_ALERTS'], msg)
-    
-    except SQLAlchemyError as e:
-        logger.error(f"Database error in check_proposal_statuses: {str(e)}")
-        raise
-    except Exception as e:
-        logger.error(f"Unexpected error in check_proposal_statuses: {str(e)}")
-        raise
-
-def get_registry_voter():
-    registry_address = '0x10101010E0C3171D894B71B3400668aF311e7D94'  # Replace with actual registry address
-    registry_abi = utils.load_abi('./abis/resupply_registry.json')
-    registry_contract = w3.eth.contract(address=registry_address, abi=registry_abi)
-    return registry_contract.functions.getAddress('VOTER').call()
-
-def fetch_logs(contract, event_name, from_block, to_block):
-    try:
-        event = getattr(contract.events, event_name)
-        
-        logs = event.get_logs(
-            fromBlock=from_block,
-            toBlock=to_block
-        )
-        return logs
-    except Exception as e:
-        logger.error(f"Error fetching logs for {event_name}: {str(e)}")
-        raise
 
 def main():
-    # Get all voter addresses including from registry
-    voter_addresses = set(VOTER_ADDRESSES)
-    try:
-        registry_voter = get_registry_voter()
-        if registry_voter != '0x0000000000000000000000000000000000000000':
-            voter_addresses.add(registry_voter)
-    except Exception as e:
-        logger.error(f"Error getting registry voter: {str(e)}")
-        logger.info("Continuing with known voter addresses only")
-    
-    logger.info("\nMonitoring voter contracts:")
-    for addr in voter_addresses:
-        logger.info(f"- {addr}")
-    
-    # Initialize contracts
-    voter_contracts = {
-        address: w3.eth.contract(address=address, abi=voter_abi)
-        for address in voter_addresses
-    }
-    
-    i = 0
-    while True:
-        try:
-            i += 1            
-            height = w3.eth.get_block_number()
-            last_block_written = get_last_block_written()
-            to_block = min(last_block_written + MAX_WIDTH, height)
-            if i % 1000 == 0:
-                logger.info(f"Loops since startup: {i}")
-                logger.info(f'Listening from block {last_block_written} --> {to_block}')
-            
-            # Log every iteration to see progress
-            logger.info(f'[DAO] Scanning blocks {last_block_written} to {to_block} (current chain height: {height})')
-            
-            # Process events for each voter contract
-            for voter_address, contract in voter_contracts.items():
-                try:
-                    # ProposalCreated
-                    logger.info(f"[DAO] Fetching ProposalCreated events for {voter_address}...")
-                    logs = fetch_logs(contract, 'ProposalCreated', last_block_written, to_block)
-                    logger.info(f"[DAO] Got {len(logs)} ProposalCreated events")
-                    if logs:
-                        logger.info(f"Found {len(logs)} ProposalCreated event(s) for voter {voter_address} in blocks {last_block_written}-{to_block}")
-                    for log in logs:
-                        handle_proposal_created(log, voter_address)
-                    
-                    # VoteCast
-                    logs = fetch_logs(contract, 'VoteCast', last_block_written, to_block)
-                    for log in logs:
-                        handle_vote_cast(log, voter_address)
-                    
-                    # ProposalCancelled
-                    logs = fetch_logs(contract, 'ProposalCancelled', last_block_written, to_block)
-                    for log in logs:
-                        handle_proposal_cancelled(log, voter_address)
-                    
-                    # ProposalExecuted
-                    logs = fetch_logs(contract, 'ProposalExecuted', last_block_written, to_block)
-                    for log in logs:
-                        handle_proposal_executed(log, voter_address)
-                    
-                    # ProposalDescriptionUpdated
-                    logs = fetch_logs(contract, 'ProposalDescriptionUpdated', last_block_written, to_block)
-                    for log in logs:
-                        handle_proposal_description_updated(log, voter_address)
-                except Exception as e:
-                    logger.error(f"Error processing events for voter {voter_address}: {str(e)}", exc_info=True)
-                    continue  # Continue with next voter contract
-            
-            # Check proposal statuses and send alerts
-            logger.info(f"[DAO] Checking proposal statuses...")
-            check_proposal_statuses()
-            logger.info(f"[DAO] Proposal status check complete")
-            
-            # Update scanner progress after processing all events
-            update_scanner_progress(to_block)
-            
-        except Exception as e:
-            logger.error(f"Error in main loop: {str(e)}")
-        
-        time.sleep(POLL_INTERVAL)
+    from dotenv import load_dotenv
+    load_dotenv()
+    store=Store.from_env()
+    w3,contracts=runtime()
+    run(store,w3,contracts)
 
-def get_hippo_id(proposal_id):
-    return str(int(proposal_id) + 9)
 
-if __name__ == '__main__':
-    main()
+def cli():
+    parser=argparse.ArgumentParser(description=__doc__)
+    group=parser.add_mutually_exclusive_group()
+    group.add_argument('--prepare-import',action='store_true')
+    group.add_argument('--adopt-boundary',action='store_true')
+    group.add_argument('--enable-alerts',action='store_true')
+    group.add_argument('--mute-alerts',action='store_true')
+    parser.add_argument('--once',action='store_true')
+    args=parser.parse_args()
+    from dotenv import load_dotenv
+    load_dotenv()
+    store=Store(os.environ['YEARN_DB_PATH'],os.environ['YEARN_IMPORT_SHA256'],rehearsal=args.prepare_import or args.adopt_boundary)
+    if args.prepare_import:
+        prepare(store)
+        return
+    if args.mute_alerts:
+        store.write(lambda c:notifications.mute(c,STREAM))
+        return
+    w3,contracts=runtime()
+    if args.adopt_boundary:
+        print(json.dumps(adopt_boundary(store,w3,contracts)))
+    elif args.enable_alerts:
+        notifications.require_permission(STREAM)
+        generation=store.read(lambda c:notifications.state(c,STREAM)['generation'])
+        poll_statuses(store,w3,generation,notifications.send_telegram,baseline=True,activate=True)
+    else:
+        run(store,w3,contracts,once=args.once)
+
+
+if __name__=='__main__':
+    cli()

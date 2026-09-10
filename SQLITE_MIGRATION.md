@@ -1,6 +1,6 @@
 # SQLite migration
 
-Status: harvest, Curve, retention, and both incentive implementations, isolated tests, and actual-data rehearsals passed; production cutover remains pending. Resupply still requires its DAO port and bundle lifecycle changes. Do not deploy this branch as a complete replacement for the running listener bundle yet.
+Status: all listener ports, isolated tests, and actual-data rehearsals passed. The bundle requires an explicit worker selection and validates prepared state before starting workers. Production cutover, combined workload checks, backup/restore, and notification activation remain pending. Deploy only through the coordinated migration procedure.
 
 The shared [migration plan](https://gist.wavey.info/RsZwJygIE49CML9UeqHdTn0l) and `server-backup` repository own the source export, baseline verification, shared database activation, and deployment sequence. All services must move to the same final frozen import. Never run SQLite writers while the public API still reads the older PostgreSQL copy.
 
@@ -8,7 +8,7 @@ The shared [migration plan](https://gist.wavey.info/RsZwJygIE49CML9UeqHdTn0l) an
 
 Use Python 3.12 with a loaded SQLite library containing the WAL-reset fix: 3.51.3 or newer, or the supported 3.50.7 / 3.44.6 maintenance releases. Startup checks the library loaded by Python, not the command-line SQLite tool. Tests and the real-data rehearsal ran on Python 3.12.14 / SQLite 3.53.1.
 
-`requirements.lock` pins application dependencies to the currently deployed listener versions, including Web3 6.15.1. Install with `uv pip sync --require-hashes requirements.lock` into a fresh environment built from the approved Python runtime. PostgreSQL's driver remains in this interim lock because the other workers still use it; remove it only after those ports are complete.
+`requirements.lock` pins the remaining application dependencies to the currently deployed listener versions, including Web3 6.15.1. Install with `uv pip sync --require-hashes requirements.lock` into a fresh environment built from the approved Python runtime. PostgreSQL's driver, the unused SQLAlchemy runtime, and the old Telegram retry library are removed. The legacy schema declaration files remain historical references; shared database creation belongs to the versioned infrastructure importer.
 
 Set the absolute `YEARN_DB_PATH`, the final import's `YEARN_IMPORT_SHA256`, and the existing `WEB3_PROVIDER_URI`. Harvest indexing has no `DATABASE_URI` fallback. The database must already exist, have the expected schema/import identity, and be explicitly ready. Production writers require WAL and use foreign keys, full synchronous commits, a five-second busy timeout, and at most three attempts of a database-only transaction. Reads are query-only.
 
@@ -78,3 +78,23 @@ YieldBasis retains its one-report-per-transaction rule. RSUP retains individual 
 The existing manual `scripts/backfill_rsup_incentives.py` is ported to SQLite and remains **dry-run by default**. It contains no notification path. Explicit `--apply` recalculates the intended corrections and applies the batch atomically only if its inspected input rows are unchanged. The migration does not run `--apply` or rewrite historical observations as part of import.
 
 The 10 September rehearsal checked both actual last-week boundaries and the following completed week. All **61** imported reports remained exactly unchanged, including prices, calculations, and JSON text; neither week contained missing transfers. Both checkpoints advanced, integrity passed, and there were **zero** transport calls. The listener suite now has **60** passing tests, including protocol calculations, historical preservation without repricing, transaction grouping, empty weeks, rollback, configured routing, silent restarts, and manual-correction concurrency checks.
+
+## DAO events, status, and reminders
+
+Run `--prepare-import` and then `--adopt-boundary` on `data_fetchers/resupply_dao.py` while the import is inactive. Adoption takes the most recent scanner record by ID, preserving the existing progress rule rather than substituting the maximum block. It reconciles that complete boundary block and records the monitored voter contracts. The fallback for an empty scanner history is explicit during adoption; normal startup never guesses progress. A changed chain, checkpoint hash, or voter-contract set stops indexing for reconciliation.
+
+The five event types are collected from every monitored voter contract, ordered by block/log position, and committed with proposal/vote changes, event identities, notification decisions, and completed-range progress. All RPC calls finish before the write transaction. Failure of any event query or write leaves the whole range unfinished. Existing votes with null log indexes are matched by their transaction and event fields, retained without adding their voting weight again, and matched at most once per distinct event. New small votes retain the existing public-alert threshold. Missing proposals and conflicting source identities require reconciliation.
+
+DAO also needs a quiet baseline for time-based state. After each startup catches up, the first status poll silently records current proposal states and consumes reminders already due during the outage. Existing reminder flags are never cleared. Normal polls use the indexed finalized chain timestamp, commit state/flags and notification decisions together, and announce only a new eligible condition. Proposal identity includes the voter contract, so reused proposal numbers do not collide. An executable proposal that has passed its deadline now advances to expired, including during quiet adoption; it no longer remains executable indefinitely because of the old polling branch gap.
+
+`--enable-alerts` requires chain catch-up, repeats quiet state adoption, and sets the latest-head notification floor in the same transaction. Public transport additionally requires `dao.allow`. All event and polled-state paths use the shared single-attempt transport. Uncertain messages, overdue reminders, and status changes observed during restart are not replayed.
+
+The 10 September rehearsal retained all **438** votes and all **2,474,383** scanner-history records exactly. All **39** proposals were retained. Quiet status adoption changed one overdue executable proposal to expired and one completed execution-delay proposal to executable; their other historical fields were unchanged. A new completed scan record was added, integrity passed, and there were **zero** transport calls. The suite now has **77** passing tests, including all DAO event paths, legacy null identities, atomic polling failure, quiet activation/restart, future reminders, status transitions, and uncertain delivery.
+
+## Bundle lifecycle and retired entry points
+
+Set `YEARN_RESUPPLY_WORKERS` explicitly to the desired comma-separated selection from `rsup-incentives,yb-incentives,dao,retention`, or pass the same selection with `--workers`. This supports sequential cutover of the four workers. Missing, unknown, empty, or repeated selections fail. `python resupply.py --check-config` checks the selected database and notification state without starting RPC or worker threads. Every selected worker is validated before any starts.
+
+Each selected worker retains its own restart loop with a 60-second delay. A restarted notification worker establishes a new floor/baseline as described above. The supervisor logs error types without credential-bearing RPC exception details. An unexpected thread exit fails the parent so the service manager can recover it.
+
+The old `data_fetchers/ybs_listener.py` and both destructive `scripts/recreate*_tables.py` entry points are retired fail-closed stubs. They perform no database or network setup. Open Data Scripts owns YBS indexing, and the infrastructure importer owns schema creation. Disable and mask the old YBS unit during the final cutover; changing its source alone is not proof that an old deployed copy cannot restart.
