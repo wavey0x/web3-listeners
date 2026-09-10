@@ -1,56 +1,27 @@
-from web3 import Web3
-from sqlalchemy import create_engine, Table, Column, Integer, String, MetaData, select
-from sqlalchemy.orm import sessionmaker
-from sqlalchemy.exc import SQLAlchemyError, IntegrityError
-from psycopg2 import errors
-import time, os, json, sys
-import telebot
+"""Curve vote indexing with durable progress and suppressed recovery notifications."""
+
+import argparse
 from datetime import datetime, timezone
-from dotenv import load_dotenv
+from decimal import Decimal, localcontext, ROUND_HALF_UP
+import json
+import os
+from pathlib import Path
+import re
+import sys
+import time
 
-# Add the parent directory of the current file to sys.path
-parent_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
-sys.path.append(parent_dir)
-import utils
-from constants import CHAT_IDS
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-
-telegram_bot_key = os.environ.get('WAVEY_ALERTS_BOT_KEY')
-bot = telebot.TeleBot(telegram_bot_key)
-load_dotenv()
+from sqlite_store import Store
+import notifications
 
 GAUGE_CONTROLLER_ADDRESS = '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
 VE_ADDRESS = '0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2'
-
-# Connection URL to your Ethereum node
-WEB3_PROVIDER_URI = os.getenv('WEB3_PROVIDER_URI')
-DATABASE_URI = os.getenv('DATABASE_URI')
-DEPLOY_BLOCK=10647875
-MAX_WIDTH = 250_000
-POLL_INTERVAL = 10 # seconds
-
-last_block_alerted = 0
-
-# Connect to Ethereum network
-w3 = Web3(Web3.HTTPProvider(WEB3_PROVIDER_URI))
-# Ensure that connection is successful
-if not w3.is_connected():
-    raise Exception("Failed to connect to Ethereum node")
-
-# Set up PostgreSQL connection
-engine = create_engine(DATABASE_URI)
-Session = sessionmaker(bind=engine)
-session = Session()
-metadata = MetaData()
-
-table = Table('curve_gauge_votes', metadata, autoload_with=engine)
-
-gauge_controller_abi = utils.load_abi('./abis/gauge_controller.json')
-ve_abi = utils.load_abi('./abis/ve.json')
-
-gauge_name_dict = {}
-gauge_controller_contract = w3.eth.contract(address=GAUGE_CONTROLLER_ADDRESS, abi=gauge_controller_abi)
-ve_contract = w3.eth.contract(address=VE_ADDRESS, abi=ve_abi)
+DEPLOY_BLOCK = 10647875
+CHUNK_SIZE = 5000
+POLL_INTERVAL = 10
+STREAM = 'curve'
+COLUMNS = ('gauge','gauge_name','account','amount','weight','account_alias','txn_hash','timestamp','date_str','block')
 
 GAUGE_NAME_EXCEPTIONS = {
     '0x6C09F6727113543Fd061a721da512B7eFCDD0267': 'xdai x3pool',
@@ -82,136 +53,247 @@ GAUGE_NAME_EXCEPTIONS = {
     '0x8CBbe2b27c574B2F283853E3eDC20271D100c285': 'CrossCurve CRV',
 }
 
-
 ALIASES = {
     '0x989AEb4d175e16225E39E87d0D97A3360524AD80': 'Convex',
     '0x7a16fF8270133F063aAb6C9977183D9e72835428': 'Mich',
     '0xF147b8125d2ef93FB6965Db97D6746952a133934': 'Yearn',
     '0x52f541764E6e90eeBc5c21Ff570De0e2D63766B6': 'Stakedao',
+    '0x490b8C6007fFa5d3728A49c2ee199e51f05D2F7e': 'Prisma',
 }
 
-def main():
-    global gauge_name_dict
-    gauge_name_dict = get_gauge_list()
-    
-    log_loop()
 
-def handle_vote_event(event):
-    global last_block_alerted
-    # Initialize gauge_name at the start to ensure it always has a value
-    gauge_name = 'Unknown Gauge Name'
-    
-    # Parse the event data and write to the database
-    block = event.blockNumber
-    timestamp = w3.eth.get_block(block).timestamp
-    date_str = datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S')
-    txn_hash = event.transactionHash.hex()
-    # Inserting data into the PostgreSQL database
-    gauge = event['args']['gauge_addr']
-    weight = event['args']['weight']
-    user = event['args']['user']
-    alias = '' if user not in ALIASES else ALIASES[user]
-    amount = ve_contract.functions.balanceOf(user).call(block_identifier=block) / 1e18 * weight / 10_000
-    if gauge in gauge_name_dict:
-        gauge_name = gauge_name_dict[gauge]
-    elif gauge in GAUGE_NAME_EXCEPTIONS:
-        gauge_name = GAUGE_NAME_EXCEPTIONS[gauge]
-    else:
-        gauge_name = 'Unknown Gauge Name'
-        send_alert(CHAT_IDS['WAVEY_ALERTS'], f"New Curve vote for a gauge that doesn't have a name!\n{gauge}")
-
-    try:
-        ins = table.insert().values(
-            gauge=gauge,
-            gauge_name=gauge_name,
-            account=user,
-            amount=amount,
-            weight=weight,
-            account_alias=alias,
-            txn_hash = txn_hash,
-            timestamp = timestamp,
-            date_str = date_str,
-            block = event.blockNumber,
-        )
-        conn = engine.connect()
-        conn.execute(ins)
-        conn.commit()
-        # conn.close()
-        print(f'{gauge} {gauge_name} vote worth {amount:,.0f} veCRV written successfully | Block: {block} Txn: {txn_hash}', flush=True)
-    except IntegrityError as e:
-        conn.rollback()
-    except SQLAlchemyError as e:
-        print("Database error occurred:", e, flush=True)
-    except Exception as e:
-        print("An error occurred:", e, flush=True)
-
-    if (
-        amount > 1_000_000
-        and user in ALIASES 
-        and block > last_block_alerted
-    ):
-        last_block_alerted = block
-        alias = ALIASES[user]
-        m = f'🗳️ Curve Gauge Vote Detected'
-        m += f'\n\n {alias}'
-        m += f'\n\n🔗 [View on Etherscan](https://etherscan.io/tx/{txn_hash})'
-        send_alert(CHAT_IDS['YLOCKERS'], m)
-
-def fetch_logs(contract, event_name, from_block, to_block):
-    event = getattr(contract.events, event_name)
-    logs = event.get_logs(
-        fromBlock=from_block,
-        toBlock=to_block
-    )
-    return logs
-
-def log_loop():
-    i = 0
-    while True:
-        i += 1
-        if i % 100 == 0: print(f"Loops since startup: {i}", flush=True)
-        height = w3.eth.get_block_number()
-        last_block_written = get_last_block_written()
-        print(f'Listening from block {last_block_written}', flush=True)
-        to_block = min(last_block_written + MAX_WIDTH, height)
-        logs = fetch_logs(
-            gauge_controller_contract, 
-            'VoteForGauge', 
-            last_block_written, 
-            to_block
-        )
-        
-        for log in logs:
-            handle_vote_event(log)
-
-        time.sleep(POLL_INTERVAL)
-
-def get_last_block_written():
-    # Connecting to the database and fetching the last block
-    with engine.connect() as conn:
-        query = select(table.c.block)
-        query = query.order_by(table.c.block.desc()).limit(1)
-        result = conn.execute(query).scalar()
-        # Return the result or DEPLOY_BLOCK if no entries found
-        return result + 1 if result is not None else DEPLOY_BLOCK
+def hex_value(value):
+    return (value if isinstance(value, str) else value.hex()).lower().removeprefix('0x')
 
 
-def get_gauge_list():
-    import requests, re
-    url = 'https://api.curve.finance/api/getAllGauges'
-    data = requests.get(url).json()['data']
-    gauge_list = {}
-    for gauge_name, d in data.items():
-        gauge_name = re.sub(r'\s*\(.*?\)', '', gauge_name)
-        if 'rootGauge' in d:
-            gauge_list[w3.to_checksum_address(d['rootGauge'])] = gauge_name
+def contracts(w3):
+    directory = Path(__file__).resolve().parents[1] / 'abis'
+    return (w3.eth.contract(address=GAUGE_CONTROLLER_ADDRESS, abi=json.loads((directory / 'gauge_controller.json').read_text())),
+            w3.eth.contract(address=VE_ADDRESS, abi=json.loads((directory / 've.json').read_text())))
+
+
+def amount_text(balance, weight, *, legacy=False):
+    with localcontext() as context:
+        context.prec = 100
+        value = Decimal(str(balance / 1e18 * weight / 10_000)) if legacy else Decimal(balance) * Decimal(weight) / Decimal(10**22)
+        return format(value.quantize(Decimal('1e-18'), rounding=ROUND_HALF_UP), 'f')
+
+
+def checkpoint(connection):
+    version = connection.execute("SELECT value FROM _migration_meta WHERE key='curve_schema_version'").fetchone()
+    if version is None or version[0] != '1':
+        raise RuntimeError('Curve schema has not been explicitly prepared')
+    row = connection.execute('SELECT * FROM curve_checkpoint WHERE stream=?', (STREAM,)).fetchone()
+    if row is None:
+        raise RuntimeError('Curve checkpoint missing; boundary adoption is required')
+    return dict(row)
+
+
+def prepare(store):
+    if not store.rehearsal:
+        raise RuntimeError('Prepare Curve state before activating the shared import')
+    def create(connection):
+        notifications.prepare(connection)
+        connection.execute("CREATE TABLE curve_checkpoint (stream TEXT PRIMARY KEY,chain_id INTEGER NOT NULL,initial_block INTEGER NOT NULL,next_block INTEGER NOT NULL,previous_hash TEXT NOT NULL,CHECK(next_block>=initial_block))")
+        connection.execute('CREATE TABLE curve_events (event_key TEXT PRIMARY KEY,block INTEGER NOT NULL)')
+        connection.execute("INSERT INTO _migration_meta VALUES ('curve_schema_version','1')")
+    store.write(create)
+
+
+def collect(w3, controller, ve, gauges, start, end):
+    end_hash = hex_value(w3.eth.get_block(end)['hash'])
+    logs = controller.events.VoteForGauge.get_logs(fromBlock=start, toBlock=end)
+    blocks, receipts, balances, items = {}, {}, {}, []
+    aliases = {key.lower(): value for key, value in ALIASES.items()}
+    names = {key.lower(): value for key, value in {**GAUGE_NAME_EXCEPTIONS, **gauges}.items()}
+    for log in sorted(logs, key=lambda item: (item['blockNumber'], item['logIndex'])):
+        block = log['blockNumber']
+        if (not start <= block <= end or log.get('removed', False)
+                or hex_value(log['address']) != hex_value(GAUGE_CONTROLLER_ADDRESS)):
+            raise RuntimeError('RPC returned an invalid Curve vote')
+        if block not in blocks:
+            blocks[block] = w3.eth.get_block(block)
+        if hex_value(blocks[block]['hash']) != hex_value(log['blockHash']):
+            raise RuntimeError('Curve vote block changed during collection')
+        tx = hex_value(log['transactionHash'])
+        if tx not in receipts:
+            receipts[tx] = w3.eth.get_transaction_receipt(log['transactionHash'])
+        receipt = receipts[tx]
+        if hex_value(receipt['blockHash']) != hex_value(log['blockHash']) or hex_value(receipt['transactionHash']) != tx:
+            raise RuntimeError('Curve vote receipt changed during collection')
+        positions = [i for i, item in enumerate(receipt['logs']) if item['logIndex'] == log['logIndex']
+                     and hex_value(item['address']) == hex_value(GAUGE_CONTROLLER_ADDRESS)]
+        if len(positions) != 1:
+            raise RuntimeError('Curve vote is missing or ambiguous in its receipt')
+        gauge, user, weight = log['args']['gauge_addr'], log['args']['user'], log['args']['weight']
+        if (user, block) not in balances:
+            balances[user, block] = ve.functions.balanceOf(user).call(block_identifier=block)
+        balance = balances[user, block]
+        timestamp = blocks[block]['timestamp']
+        row = dict(zip(COLUMNS, (gauge, names.get(gauge.lower(), 'Unknown Gauge Name'), user,
+                   amount_text(balance, weight), weight, aliases.get(user.lower(), ''), log['transactionHash'].hex(),
+                   timestamp, datetime.fromtimestamp(timestamp, timezone.utc).strftime('%Y-%m-%d %H:%M:%S'), block)))
+        items.append(dict(key=f'1:{GAUGE_CONTROLLER_ADDRESS.lower()}:{tx}:{positions[0]}', row=row,
+                          legacy_amount=amount_text(balance, weight, legacy=True), unknown=gauge.lower() not in names))
+    if hex_value(w3.eth.get_block(end)['hash']) != end_hash:
+        raise RuntimeError('Curve range changed during collection')
+    return items, end_hash
+
+
+def insert_row(connection, row):
+    connection.execute('INSERT INTO curve_gauge_votes (' + ','.join(COLUMNS) + ') VALUES (' + ','.join('?' for _ in COLUMNS) + ')',
+                       tuple(row[key] for key in COLUMNS))
+
+
+def matches_import(row, item):
+    candidate = item['row']
+    return (all(hex_value(row[key]) == hex_value(candidate[key]) for key in ('gauge','account','txn_hash'))
+            and all(row[key] == candidate[key] for key in ('weight','timestamp','date_str','block'))
+            and Decimal(row['amount']) in (Decimal(item['legacy_amount']), Decimal(candidate['amount'])))
+
+
+def adopt_boundary(store, w3, controller, ve, gauges):
+    if not store.rehearsal or w3.eth.chain_id != 1:
+        raise RuntimeError('Adopt Curve boundaries in an inactive mainnet import')
+    rows = store.read(lambda connection: [dict(row) for row in connection.execute(
+        'SELECT * FROM curve_gauge_votes WHERE block=(SELECT max(block) FROM curve_gauge_votes) ORDER BY id')])
+    boundary = rows[0]['block'] if rows else DEPLOY_BLOCK - 1
+    if boundary > w3.eth.get_block('finalized')['number']:
+        raise RuntimeError('Wait for the imported Curve boundary to become finalized')
+    items, block_hash = collect(w3, controller, ve, gauges, boundary, boundary)
+    unmatched = set(range(len(items)))
+    duplicates = 0
+    for row in rows:
+        candidates = [i for i, item in enumerate(items) if matches_import(row, item)]
+        if not candidates:
+            raise RuntimeError('Imported Curve boundary row does not match chain data; reconciliation required')
+        available = [i for i in candidates if i in unmatched]
+        if available:
+            unmatched.remove(available[0])
         else:
-            gauge_list[w3.to_checksum_address(d['gauge'])] = gauge_name
-    return gauge_list
+            duplicates += 1  # Retain existing source duplicates, never create replacements.
+    def adopt(connection):
+        connection.execute('INSERT INTO curve_checkpoint VALUES (?,?,?,?,?)', (STREAM,1,boundary+1,boundary+1,block_hash))
+        notifications.add_stream(connection, STREAM, boundary, block_hash)
+        for index, item in enumerate(items):
+            connection.execute('INSERT INTO curve_events VALUES (?,?)', (item['key'], boundary))
+            if index in unmatched:
+                insert_row(connection, item['row'])
+        return dict(next_block=boundary+1, imported_boundary_rows=len(rows), source_duplicates=duplicates,
+                    missing_boundary_events=len(unmatched))
+    return store.write(adopt)
 
 
-def send_alert(chat_id, msg):
-    bot.send_message(chat_id, msg, parse_mode="markdown", disable_web_page_preview = True)
+def alerts(item):
+    row = item['row']
+    if item['unknown']:
+        yield ('unknown-gauge', 'WAVEY_ALERTS', "New Curve vote for a gauge that doesn't have a name!\n" + row['gauge'], False)
+    if Decimal(row['amount']) > 1_000_000 and row['account_alias']:
+        message = '🗳️ Curve Gauge Vote Detected'
+        message += '\n\n ' + row['account_alias']
+        message += '\n\n🔗 [View on Etherscan](https://etherscan.io/tx/' + row['txn_hash'] + ')'
+        yield ('large-vote', 'YLOCKERS', message, True)
+
+
+def scan_once(store, w3, controller, ve, gauges, generation, send):
+    previous = store.read(checkpoint)
+    if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
+        raise RuntimeError('Curve checkpoint chain does not match RPC')
+    start = previous['next_block']
+    if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
+        raise RuntimeError('Curve checkpoint block changed; reconciliation required')
+    height = w3.eth.get_block('finalized')['number']
+    if start > height:
+        return
+    end = min(start + CHUNK_SIZE - 1, height)
+    items, block_hash = collect(w3, controller, ve, gauges, start, end)
+    if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
+        raise RuntimeError('Curve checkpoint block changed during collection')
+    def commit(connection):
+        if checkpoint(connection) != previous or notifications.state(connection, STREAM)['generation'] != generation:
+            raise RuntimeError('Curve scan session or checkpoint advanced concurrently')
+        claims = []
+        for item in items:
+            if not connection.execute('INSERT INTO curve_events VALUES (?,?) ON CONFLICT(event_key) DO NOTHING',
+                                      (item['key'], item['row']['block'])).rowcount:
+                continue
+            insert_row(connection, item['row'])
+            for kind, destination, message, per_block in alerts(item):
+                claim = notifications.decide(connection, STREAM, generation, item['key'], item['row']['block'],
+                                             kind, destination, message, once_per_block=per_block)
+                if claim:
+                    claims.append((claim, message))
+        connection.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
+        return claims
+    claims = store.write(commit)
+    for claim, message in claims:
+        notifications.dispatch(store, claim, message, send)
+
+
+def get_gauge_list(w3):
+    import requests
+    response = requests.get('https://api.curve.finance/api/getAllGauges', timeout=(5,30))
+    response.raise_for_status()
+    data = response.json()['data']
+    if not isinstance(data, dict) or not data:
+        raise RuntimeError('Curve gauge metadata is unavailable; do not classify every gauge as unknown')
+    return {w3.to_checksum_address(value.get('rootGauge') or value['gauge']): re.sub(r'\s*\(.*?\)', '', name)
+            for name, value in data.items()}
+
+
+def enable_future_alerts(store, w3):
+    finalized = w3.eth.get_block('finalized')['number']
+    previous = store.read(checkpoint)
+    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= finalized
+            or hex_value(w3.eth.get_block(previous['next_block'] - 1)['hash']) != previous['previous_hash']):
+        raise RuntimeError('Curve must finish validated silent catch-up before enabling alerts')
+    latest = w3.eth.get_block('latest')
+    def enable(connection):
+        if checkpoint(connection)['next_block'] <= finalized:
+            raise RuntimeError('Curve catch-up position changed before activation')
+        notifications.enable(connection, STREAM, latest['number'], hex_value(latest['hash']))
+    store.write(enable)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument('--prepare-import', action='store_true')
+    actions.add_argument('--adopt-boundary', action='store_true')
+    actions.add_argument('--enable-alerts', action='store_true')
+    actions.add_argument('--mute-alerts', action='store_true')
+    parser.add_argument('--once', action='store_true')
+    args = parser.parse_args()
+    from dotenv import load_dotenv
+    load_dotenv()
+    store = Store(os.environ['YEARN_DB_PATH'], os.environ['YEARN_IMPORT_SHA256'],
+                  rehearsal=args.prepare_import or args.adopt_boundary)
+    if args.prepare_import:
+        prepare(store)
+        return
+    if args.mute_alerts:
+        store.write(lambda connection: notifications.mute(connection, STREAM))
+        return
+    from web3 import Web3
+    w3 = Web3(Web3.HTTPProvider(os.environ['WEB3_PROVIDER_URI'], request_kwargs={'timeout':60}))
+    if args.enable_alerts:
+        notifications.require_permission(STREAM)
+        enable_future_alerts(store, w3)
+        return
+    controller, ve = contracts(w3)
+    gauges = get_gauge_list(w3)
+    if args.adopt_boundary:
+        print(json.dumps(adopt_boundary(store, w3, controller, ve, gauges)))
+        return
+    if w3.eth.chain_id != 1:
+        raise RuntimeError('Curve notifications require Ethereum mainnet')
+    latest = w3.eth.get_block('latest')
+    generation = notifications.start_session(store, STREAM, latest['number'], hex_value(latest['hash']))
+    while True:
+        scan_once(store, w3, controller, ve, gauges, generation, notifications.send_telegram)
+        if args.once:
+            return
+        time.sleep(POLL_INTERVAL)
 
 
 if __name__ == '__main__':
