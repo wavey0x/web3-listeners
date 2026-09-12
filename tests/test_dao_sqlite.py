@@ -37,7 +37,7 @@ class Chain:
         self.eth=self
         self.chain_id=1
         self.height=12
-        self.latest=14
+        self.latest=12
         self.logs=[]
         self.fail_name=None
         self.hash_changes={}
@@ -53,7 +53,7 @@ class Chain:
         return SimpleNamespace(events=events,functions=SimpleNamespace(proposalDescription=lambda proposal:SimpleNamespace(call=lambda **kwargs:'Description')))
 
     def get_block(self,number):
-        number=self.height if number=='finalized' else self.latest if number=='latest' else number
+        number=self.height if number=='finalized' else max(self.height,self.latest) if number=='latest' else number
         return dict(number=number,hash=self.hash_changes.get(number,block_hash(number)),timestamp=self.timestamps.get(number,1700000000+number))
 
     def get_transaction_receipt(self,tx):
@@ -128,7 +128,7 @@ class DaoTests(unittest.TestCase):
 
     def advance_time(self,now):
         self.chain.height+=1
-        self.chain.latest=max(self.chain.latest,self.chain.height+2)
+        self.chain.latest=self.chain.height
         self.chain.timestamps[self.chain.height]=now
         self.scan()
 
@@ -160,6 +160,38 @@ class DaoTests(unittest.TestCase):
         self.assertEqual([r['status'] for r in self.rows('resupply_proposals')],['cancelled','open'])
         self.assertEqual(len(self.sent),3)
         self.assertEqual(self.sent[0][:2],('dao','RESUPPLY_ALERTS'))
+
+    def test_execution_alert_arrives_before_finality_and_is_not_resent(self):
+        self.seed()
+        self.activate()
+        self.proposal(proposal='29',status='executable')
+        self.chain.latest=14
+        self.chain.logs=[event('ProposalExecuted',block=14,proposal='29')]
+        self.scan()
+        self.assertEqual(self.chain.height,12)
+        self.assertEqual(self.state()['next_block'],15)
+        self.assertEqual(self.rows('resupply_proposals')[0]['status'],'executed')
+        self.assertEqual(len(self.sent),1)
+        self.assertIn('Proposal Executed',self.sent[0][2])
+        self.assertEqual(self.rows('notification_decisions')[0]['status'],'delivered')
+        self.chain.height=14
+        self.scan()
+        self.assertEqual(len(self.sent),1)
+
+    def test_status_transition_uses_latest_indexed_timestamp(self):
+        self.seed()
+        self.activate()
+        self.proposal(end=self.chain.get_block(14)['timestamp'])
+        self.scan()
+        self.poll(baseline=True)
+        self.chain.latest=14
+        self.assertFalse(self.poll())  # Status must wait for indexing, not finality.
+        self.scan()
+        self.poll()
+        self.assertEqual(self.chain.height,12)
+        self.assertEqual(self.rows('dao_poll_checkpoint')[0]['block'],14)
+        self.assertEqual(len(self.sent),1)
+        self.assertIn('Proposal Passed',self.sent[0][2])
 
     def test_any_event_rpc_or_write_failure_leaves_entire_range_unchanged(self):
         self.seed()
@@ -285,6 +317,7 @@ class DaoTests(unittest.TestCase):
         self.assertTrue(self.rows('resupply_proposals')[0]['ending_soon_alert_sent'])
 
     def test_activation_silently_adopts_polled_state_and_latest_floor(self):
+        self.chain.latest=14
         self.seed()
         self.activate()
         self.proposal(end=self.chain.get_block(12)['timestamp']+1)

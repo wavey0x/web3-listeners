@@ -3,10 +3,13 @@
 from dataclasses import dataclass
 import hashlib
 import json
+import logging
 import os
 from pathlib import Path
 import re
 import stat
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -74,8 +77,11 @@ def start_session(store, stream, latest_block, latest_hash):
     def start(connection):
         _advance_floor(connection, stream, latest_block, latest_hash)
         connection.execute('UPDATE notification_streams SET generation=generation+1 WHERE stream=?', (stream,))
-        return state(connection, stream)['generation']
-    return store.write(start)
+        return state(connection, stream)
+    current = store.write(start)
+    logger.info('Notification session: stream=%s generation=%s enabled=%s floor_block=%s',
+                stream,current['generation'],current['enabled'],current['floor_block'])
+    return current['generation']
 
 
 def enable(connection, stream, latest_block, latest_hash):
@@ -139,9 +145,11 @@ def dispatch(store, claim, message, send):
         # If this update also fails, the durable 'attempted' state still forbids replay.
         store.write(lambda connection: connection.execute('''UPDATE notification_decisions SET status='uncertain'
             WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()))
+        logger.error('Notification uncertain: stream=%s kind=%s event=%s',claim.stream,claim.kind,claim.event_key)
         raise RuntimeError('Notification delivery outcome is uncertain; automatic retry is disabled') from None
     store.write(lambda connection: connection.execute('''UPDATE notification_decisions SET status='delivered'
         WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()))
+    logger.info('Notification delivered: stream=%s kind=%s event=%s',claim.stream,claim.kind,claim.event_key)
     return True
 
 

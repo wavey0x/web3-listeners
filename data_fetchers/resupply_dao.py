@@ -3,6 +3,7 @@
 import argparse
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -13,7 +14,8 @@ sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from sqlite_store import Store
 import notifications
 
-POLL_INTERVAL = 10
+logger = logging.getLogger(__name__)
+POLL_INTERVAL = 2
 EXECUTION_DELAY = 60 * 60 * 24
 EXECUTION_DEADLINE = 21 * 24 * 60 * 60
 VOTING_PERIOD = 60 * 60 * 24 * 7
@@ -264,10 +266,10 @@ def scan_once(store,w3,contracts,generation,send):
     start=previous['next_block']
     if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
         raise RuntimeError('DAO checkpoint block changed; reconciliation required')
-    finalized=w3.eth.get_block('finalized')
-    if start>finalized['number']:
+    head=w3.eth.get_block('latest')
+    if start>head['number']:
         return False
-    end=min(start+CHUNK_SIZE-1,finalized['number'])
+    end=min(start+CHUNK_SIZE-1,head['number'])
     items,block_hash=collect(w3,contracts,start,end)
     if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
         raise RuntimeError('DAO checkpoint changed during collection')
@@ -279,7 +281,9 @@ def scan_once(store,w3,contracts,generation,send):
         # Preserve the full source history and its established meaning. New rows represent completed ranges.
         c.execute('INSERT INTO resupply_scanner_progress(last_scanned_block,updated_at) VALUES (?,?)',(end,int(time.time())))
         return claims
-    for claim,message in store.write(commit):
+    claims=store.write(commit)
+    logger.info('DAO scanned blocks %s-%s: %s events, %s alerts',start,end,len(items),len(claims))
+    for claim,message in claims:
         notifications.dispatch(store,claim,message,send)
     return True
 
@@ -318,8 +322,7 @@ def status_message(row,kind):
 
 def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
     """Advance current state once; startup/activation adopts existing conditions silently."""
-    head=w3.eth.get_block('finalized')
-    latest=w3.eth.get_block('latest') if activate else None
+    head=w3.eth.get_block('latest')
     chain_id=w3.eth.chain_id
     now=head['timestamp']
     def commit(c):
@@ -329,7 +332,7 @@ def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
         if previous['next_block']<=head['number']:
             if activate:
                 raise RuntimeError('DAO must finish silent chain catch-up before activation')
-            return None  # A new finalized block may arrive between the idle scan and this poll.
+            return None  # A new block may arrive between the idle scan and this poll.
         session=notifications.state(c,STREAM)
         if session['generation']!=generation:
             raise RuntimeError('DAO polling session changed')
@@ -380,7 +383,7 @@ def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
         if activate:
             if not baseline:
                 raise RuntimeError('DAO activation requires quiet state adoption')
-            notifications.enable(c,STREAM,latest['number'],hex_value(latest['hash']))
+            notifications.enable(c,STREAM,head['number'],hex_value(head['hash']))
         return claims
     claims=store.write(commit)
     if claims is None:
@@ -398,7 +401,7 @@ def runtime():
     root=Path(__file__).resolve().parents[1]/'abis'
     voter_abi=json.loads((root/'resupply_voter.json').read_text())
     registry=w3.eth.contract(address=REGISTRY,abi=json.loads((root/'resupply_registry.json').read_text()))
-    registered=registry.functions.getAddress('VOTER').call(block_identifier='finalized')
+    registered=registry.functions.getAddress('VOTER').call(block_identifier='latest')
     addresses=set(VOTER_ADDRESSES)
     if int(registered,16):
         addresses.add(registered)
@@ -411,7 +414,7 @@ def run(store,w3,contracts,*,once=False):
     baseline_needed=True
     while True:
         progressed=scan_once(store,w3,contracts,generation,notifications.send_telegram)
-        # Poll only when all event types and contracts have reached the same finalized head.
+        # Poll only when all event types and contracts have reached the same latest head.
         if not progressed:
             if poll_statuses(store,w3,generation,notifications.send_telegram,baseline=baseline_needed):
                 baseline_needed=False

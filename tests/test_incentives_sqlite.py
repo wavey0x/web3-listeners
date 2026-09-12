@@ -42,7 +42,7 @@ class Chain:
         self.ranges=[]
 
     def get_block(self,number):
-        number=self.height if number=='finalized' else self.latest if number=='latest' else number
+        number=self.height if number=='finalized' else max(self.height,self.latest) if number=='latest' else number
         return dict(number=number,hash=self.hash_changes.get(number,block_hash(number)),timestamp=number*(WEEK//10))
 
     def get_transaction_receipt(self,tx):
@@ -204,6 +204,28 @@ class IncentiveTests(unittest.TestCase):
         self.assertEqual(self.sent[0][:2],('rsup-incentives','WAVEY_ALERTS'))
         self.scan()
         self.assertEqual(len(self.sent),1)
+
+    def test_report_waits_for_week_close_but_not_finality(self):
+        self.seed()
+        self.activate()
+        self.chain.height=1005
+        self.chain.latest=1010  # Week ended, but calculation needs the next block.
+        self.chain.logs=[transfer(self.adapter.TOKEN)]
+        self.assertFalse(self.scan())
+        self.assertEqual(self.sent,[])
+        self.chain.latest=1011
+        self.assertTrue(self.scan())
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(self.adapter.build_record.call_args.args[-1],1011)
+        self.chain.height=1011
+        self.assertFalse(self.scan())
+        self.assertEqual(len(self.sent),1)
+
+    def test_polling_wakes_at_week_close_and_retries_promptly(self):
+        self.assertEqual(worker.poll_delay(PERIOD,PERIOD,3600),3600)
+        self.assertEqual(worker.poll_delay(PERIOD,PERIOD+WEEK-5,3600),5)
+        self.assertEqual(worker.poll_delay(PERIOD,PERIOD+WEEK,3600),2)
+        self.assertEqual(worker.poll_delay(PERIOD,PERIOD+WEEK+60,3600),2)
 
     def test_insert_and_calculation_failure_leave_period_and_alerts_unchanged(self):
         self.seed()

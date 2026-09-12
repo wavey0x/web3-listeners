@@ -18,7 +18,7 @@ import notifications
 logger = logging.getLogger(__name__)
 CONTRACT_ADDRESS = '0xB9415639618e70aBb71A0F4F8bbB2643Bf337892'
 DEPLOYMENT_BLOCK = 22870945
-POLL_INTERVAL = 10
+POLL_INTERVAL = 2
 CHUNK_SIZE = 5000
 STREAM = 'retention'
 COLUMNS = ('user_address','old_weight','new_weight','weight_diff','block','txn_hash','timestamp','date_str','log_index')
@@ -177,7 +177,7 @@ def scan_once(store, w3, contract, original_supply, generation, send):
     start = previous['next_block']
     if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
         raise RuntimeError('Retention checkpoint block changed; reconciliation required')
-    height = w3.eth.get_block('finalized')['number']
+    height = w3.eth.get_block('latest')['number']
     if start > height:
         return False
     end = min(start+CHUNK_SIZE-1,height)
@@ -201,20 +201,21 @@ def scan_once(store, w3, contract, original_supply, generation, send):
                     claims.append((claim,item['message']))
         connection.execute('UPDATE retention_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
         return claims
-    for claim, message in store.write(commit):
+    claims = store.write(commit)
+    logger.info('Retention scanned blocks %s-%s: %s events, %s alerts',start,end,len(items),len(claims))
+    for claim, message in claims:
         notifications.dispatch(store,claim,message,send)
     return True
 
 
 def enable_future_alerts(store,w3):
-    finalized = w3.eth.get_block('finalized')['number']
+    latest = w3.eth.get_block('latest')
     previous = store.read(checkpoint)
-    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= finalized
+    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= latest['number']
             or hex_value(w3.eth.get_block(previous['next_block']-1)['hash']) != previous['previous_hash']):
         raise RuntimeError('Retention must finish validated silent catch-up before enabling alerts')
-    latest = w3.eth.get_block('latest')
     def enable(connection):
-        if checkpoint(connection)['next_block'] <= finalized:
+        if checkpoint(connection)['next_block'] <= latest['number']:
             raise RuntimeError('Retention catch-up changed before activation')
         notifications.enable(connection,STREAM,latest['number'],hex_value(latest['hash']))
     store.write(enable)

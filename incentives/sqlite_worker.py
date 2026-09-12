@@ -49,12 +49,12 @@ def checkpoint(c, protocol):
 
 
 def first_block(w3, timestamp, height, *, strictly_after=False):
-    """Find a timestamp boundary within a caller's fixed finalized head."""
+    """Find a timestamp boundary within a caller's fixed chain head."""
     def before(number):
         value=w3.eth.get_block(number)['timestamp']
         return value<=timestamp if strictly_after else value<timestamp
     if before(height):
-        raise RuntimeError('Incentive period boundary is not finalized yet')
+        raise RuntimeError('Incentive period boundary is not on chain yet')
     low,high=0,height
     while low<high:
         middle=(low+high)//2
@@ -65,17 +65,17 @@ def first_block(w3, timestamp, height, *, strictly_after=False):
     return low
 
 
-def window(w3, period, finalized):
-    if finalized['timestamp']<=period+WEEK:
-        raise RuntimeError('Incentive period boundary is not finalized yet')
-    start=first_block(w3,period,finalized['number'])
-    stop=first_block(w3,period+WEEK,finalized['number'])
-    effective=first_block(w3,period+WEEK,finalized['number'],strictly_after=True)
+def window(w3, period, head):
+    if head['timestamp']<=period+WEEK:
+        raise RuntimeError('Incentive period boundary is not on chain yet')
+    start=first_block(w3,period,head['number'])
+    stop=first_block(w3,period+WEEK,head['number'])
+    effective=first_block(w3,period+WEEK,head['number'],strictly_after=True)
     return start,stop-1,effective
 
 
-def collect(adapter,w3,period,finalized):
-    start,end,effective=window(w3,period,finalized)
+def collect(adapter,w3,period,head):
+    start,end,effective=window(w3,period,head)
     end_hash=hex_value(w3.eth.get_block(end)['hash'])
     effective_hash=hex_value(w3.eth.get_block(effective)['hash'])
     logs=[]
@@ -187,11 +187,11 @@ def scan_once(store,w3,adapter,generation,send):
         raise RuntimeError('Incentive checkpoint chain does not match RPC')
     if hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']:
         raise RuntimeError('Incentive checkpoint block changed; reconciliation required')
-    finalized=w3.eth.get_block('finalized')
+    head=w3.eth.get_block('latest')
     period=previous['next_period']
-    if finalized['timestamp']<=period+WEEK:
+    if head['timestamp']<=period+WEEK:
         return False
-    items,end,end_hash,effective,effective_hash=collect(adapter,w3,period,finalized)
+    items,end,end_hash,effective,effective_hash=collect(adapter,w3,period,head)
     imported=store.read(lambda c:[dict(row) for row in c.execute('SELECT * FROM incentives WHERE protocol=? AND period_start=?',
                                                                (adapter.PROTOCOL,period))])
     build_new(adapter,items,imported,period)
@@ -229,11 +229,10 @@ def scan_once(store,w3,adapter,generation,send):
 
 def enable_future_alerts(store,w3,adapter):
     previous=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))
-    finalized=w3.eth.get_block('finalized')
-    if (w3.eth.chain_id!=1 or previous['chain_id']!=1 or finalized['timestamp']>previous['next_period']+WEEK
+    latest=w3.eth.get_block('latest')
+    if (w3.eth.chain_id!=1 or previous['chain_id']!=1 or latest['timestamp']>previous['next_period']+WEEK
             or hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']):
         raise RuntimeError('Incentives must finish validated silent catch-up before enabling alerts')
-    latest=w3.eth.get_block('latest')
     def enable(c):
         if checkpoint(c,adapter.PROTOCOL)!=previous:
             raise RuntimeError('Incentive catch-up changed before activation')
@@ -250,6 +249,11 @@ def runtime(adapter):
     return w3
 
 
+def poll_delay(next_period,now,max_interval):
+    """Wake at week close, then poll promptly until its calculation block exists."""
+    return min(max_interval,max(2,next_period+WEEK-now))
+
+
 def run(store,w3,adapter,*,once=False):
     latest=w3.eth.get_block('latest')
     generation=notifications.start_session(store,adapter.STREAM,latest['number'],hex_value(latest['hash']))
@@ -258,7 +262,8 @@ def run(store,w3,adapter,*,once=False):
         if once:
             return
         if not progressed:
-            time.sleep(adapter.POLL_INTERVAL)
+            next_period=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))['next_period']
+            time.sleep(poll_delay(next_period,time.time(),adapter.POLL_INTERVAL))
 
 
 def main(adapter):

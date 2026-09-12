@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext, ROUND_HALF_UP
 import json
+import logging
 import os
 from pathlib import Path
 import re
@@ -15,11 +16,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlite_store import Store
 import notifications
 
+logger = logging.getLogger(__name__)
+
 GAUGE_CONTROLLER_ADDRESS = '0x2F50D538606Fa9EDD2B11E2446BEb18C9D5846bB'
 VE_ADDRESS = '0x5f3b5DfEb7B28CDbD7FAba78963EE202a494e2A2'
 DEPLOY_BLOCK = 10647875
 CHUNK_SIZE = 5000
-POLL_INTERVAL = 10
+POLL_INTERVAL = 2
 STREAM = 'curve'
 COLUMNS = ('gauge','gauge_name','account','amount','weight','account_alias','txn_hash','timestamp','date_str','block')
 
@@ -202,7 +205,7 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
     start = previous['next_block']
     if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
         raise RuntimeError('Curve checkpoint block changed; reconciliation required')
-    height = w3.eth.get_block('finalized')['number']
+    height = w3.eth.get_block('latest')['number']
     if start > height:
         return
     end = min(start + CHUNK_SIZE - 1, height)
@@ -226,6 +229,7 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
         connection.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
         return claims
     claims = store.write(commit)
+    logger.info('Curve scanned blocks %s-%s: %s events, %s alerts',start,end,len(items),len(claims))
     for claim, message in claims:
         notifications.dispatch(store, claim, message, send)
 
@@ -242,20 +246,20 @@ def get_gauge_list(w3):
 
 
 def enable_future_alerts(store, w3):
-    finalized = w3.eth.get_block('finalized')['number']
+    latest = w3.eth.get_block('latest')
     previous = store.read(checkpoint)
-    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= finalized
+    if (w3.eth.chain_id != 1 or previous['chain_id'] != 1 or previous['next_block'] <= latest['number']
             or hex_value(w3.eth.get_block(previous['next_block'] - 1)['hash']) != previous['previous_hash']):
         raise RuntimeError('Curve must finish validated silent catch-up before enabling alerts')
-    latest = w3.eth.get_block('latest')
     def enable(connection):
-        if checkpoint(connection)['next_block'] <= finalized:
+        if checkpoint(connection)['next_block'] <= latest['number']:
             raise RuntimeError('Curve catch-up position changed before activation')
         notifications.enable(connection, STREAM, latest['number'], hex_value(latest['hash']))
     store.write(enable)
 
 
 def main():
+    logging.basicConfig(level=logging.INFO,format='%(asctime)s %(levelname)s %(message)s')
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument('--prepare-import', action='store_true')

@@ -31,7 +31,7 @@ class Chain:
         self.eth = self
         self.chain_id = 1
         self.height = 12
-        self.latest = 14
+        self.latest = 12
         self.logs = []
         self.fail = False
         self.hash_changes = {}
@@ -39,7 +39,7 @@ class Chain:
             functions=SimpleNamespace(totalSupply=lambda:SimpleNamespace(call=lambda **kwargs:10**76)))
 
     def get_block(self, number):
-        number = self.height if number == 'finalized' else self.latest if number == 'latest' else number
+        number = self.height if number == 'finalized' else max(self.height,self.latest) if number == 'latest' else number
         return dict(number=number, hash=self.hash_changes.get(number,block_hash(number)),timestamp=1700000000+number)
 
     def get_logs(self, fromBlock, toBlock):
@@ -148,6 +148,19 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.sent,[])
 
+    def test_latest_weight_alert_does_not_wait_for_finality_or_repeat(self):
+        self.seed()
+        self.activate()
+        self.chain.latest=14
+        self.chain.logs=[weight(block=14)]
+        self.scan()
+        self.assertEqual(self.chain.height,12)
+        self.assertEqual(self.state()['next_block'],15)
+        self.assertEqual(len(self.sent),1)
+        self.chain.height=14
+        self.scan()
+        self.assertEqual(len(self.sent),1)
+
     def test_duplicate_legacy_row_never_alerts(self):
         self.seed()
         self.chain.logs=[weight()]
@@ -230,6 +243,7 @@ class RetentionTests(unittest.TestCase):
         self.assertIsNone(items[0]['message'])
 
     def test_activation_requires_catchup_and_sets_latest_floor(self):
+        self.chain.latest=14
         self.seed()
         self.activate()
         with self.assertRaisesRegex(RuntimeError,'silent catch-up'):

@@ -33,7 +33,7 @@ class Chain:
         self.eth = self
         self.chain_id = 1
         self.height = 12
-        self.latest = 14
+        self.latest = 12
         self.logs = []
         self.balances = {}
         self.fail = False
@@ -45,7 +45,7 @@ class Chain:
         return SimpleNamespace(call=lambda **kwargs:self.balances.get(user,2_000_000*10**18))
 
     def get_block(self,number):
-        number = self.height if number=='finalized' else self.latest if number=='latest' else number
+        number = self.height if number=='finalized' else max(self.height,self.latest) if number=='latest' else number
         return dict(number=number,hash=self.hash_changes.get(number,block_hash(number)),timestamp=1700000000+number)
 
     def get_logs(self,fromBlock,toBlock):
@@ -140,6 +140,20 @@ class CurveTests(unittest.TestCase):
         self.scan()
         self.assertEqual(len(self.sent),1)
         self.assertIsNone(self.decide('third-vote',kind='large-vote',per_block=True))
+
+    def test_latest_vote_alert_does_not_wait_for_finality_or_repeat(self):
+        self.seed()
+        self.activate()
+        self.chain.latest=14
+        self.chain.logs=[vote(block=14)]
+        self.scan()
+        self.assertEqual(self.chain.height,12)
+        self.assertEqual(self.state()['next_block'],15)
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(self.sent[0][0],'YLOCKERS')
+        self.chain.height=14
+        self.scan()
+        self.assertEqual(len(self.sent),1)
 
     def test_unknown_and_large_alerts_follow_data_commit(self):
         self.seed()
@@ -298,6 +312,7 @@ class CurveTests(unittest.TestCase):
         self.assertEqual(self.sent,[])
 
     def test_activation_requires_catchup_and_sets_latest_not_finalized_floor(self):
+        self.chain.latest=14
         self.seed()
         self.activate()
         with self.assertRaisesRegex(RuntimeError,'silent catch-up'):
