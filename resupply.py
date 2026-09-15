@@ -48,7 +48,8 @@ def run_worker(name,entry,stop):
             raise RuntimeError('Worker returned unexpectedly')
         except Exception as error:
             if not recovery.transient(error):
-                logger.error('%s requires operator action (%s)', name, type(error).__name__)
+                logger.error('%s requires operator action: %s', name,
+                             str(error) if isinstance(error, recovery.FatalError) else type(error).__name__)
                 stop.set()
                 return
             # RPC exceptions can contain credentials. Keep their details out of supervisor logs.

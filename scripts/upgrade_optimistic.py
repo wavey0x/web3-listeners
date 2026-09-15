@@ -12,6 +12,9 @@ import recovery
 
 def upgrade(store):
     def migrate(c):
+        version=c.execute("SELECT value FROM _migration_meta WHERE key='notification_schema_version'").fetchone()
+        if version is None or version[0] not in ('1','2'):
+            raise RuntimeError('Unsupported notification schema for this upgrade')
         if c.execute('SELECT count(*) FROM notification_streams WHERE enabled!=0').fetchone()[0]:
             raise RuntimeError('Mute notification streams before upgrading')
         recovery.prepare(c)

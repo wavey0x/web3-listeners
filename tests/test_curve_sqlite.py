@@ -445,5 +445,13 @@ class CurveTests(unittest.TestCase):
         self.assert_no_history()
 
 
+    def test_invalid_fallback_position_cannot_skip_records(self):
+        self.seed(); self.activate(); self.scan()
+        self.store.write(lambda c:c.execute("UPDATE recovery_points SET position=99999 WHERE stream='curve'"))
+        previous=self.state()
+        with self.assertRaisesRegex(RuntimeError,'outside the processed import range'): self.scan()
+        self.assertEqual(self.state(),previous)
+
+
 if __name__=='__main__':
     unittest.main()

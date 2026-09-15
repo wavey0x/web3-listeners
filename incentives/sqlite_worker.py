@@ -247,6 +247,10 @@ def scan_once(store,w3,adapter,generation,send):
     imported=store.read(lambda c:[dict(row) for row in c.execute('SELECT * FROM incentives WHERE protocol=? AND period_start=?',
                                                                (adapter.PROTOCOL,period))])
     build_new(adapter,items,imported,period)
+    calculation = store.read(lambda c: c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
+                                                 (adapter.PROTOCOL,)).fetchone())
+    if calculation is not None and hex_value(w3.eth.get_block(calculation['block'])['hash']) != calculation['block_hash']:
+        raise recovery.ChainChanged('Previous incentive calculation block changed during collection')
     if (hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']
             or hex_value(w3.eth.get_block(end)['hash'])!=end_hash
             or hex_value(w3.eth.get_block(effective)['hash'])!=effective_hash):
@@ -281,6 +285,10 @@ def scan_once(store,w3,adapter,generation,send):
 
 def enable_future_alerts(store,w3,adapter):
     previous=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))
+    calculation=store.read(lambda c:c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
+                                             (adapter.PROTOCOL,)).fetchone())
+    if calculation is not None and hex_value(w3.eth.get_block(calculation['block'])['hash'])!=calculation['block_hash']:
+        raise RuntimeError('Incentive calculation block changed; finish reconciliation before activation')
     latest=w3.eth.get_block('latest')
     if (w3.eth.chain_id!=1 or previous['chain_id']!=1 or latest['timestamp']>previous['next_period']+WEEK
             or hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']):

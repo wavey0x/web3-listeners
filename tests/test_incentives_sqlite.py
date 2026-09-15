@@ -344,6 +344,29 @@ class IncentiveTests(unittest.TestCase):
         self.assertEqual(self.state()['next_period'],PERIOD+WEEK)
 
 
+    def test_previous_calculation_change_during_next_report_is_not_committed(self):
+        self.seed(); self.activate()
+        self.chain.height=1005; self.chain.latest=1011
+        self.chain.logs=[transfer(self.adapter.TOKEN)]
+        self.scan()
+        original=self.rows('incentives')
+        previous=self.state()
+        self.chain.latest=1021
+        self.chain.logs.append(transfer(self.adapter.TOKEN,block=1015))
+        build=self.adapter.build_record.side_effect
+        def change_chain(*args):
+            row=build(*args)
+            self.chain.hash_changes[1011]=block_hash(9999)
+            return row
+        self.adapter.build_record.side_effect=change_chain
+        with self.assertRaisesRegex(RuntimeError,'Previous incentive calculation block changed'):
+            self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.rows('incentives'),original)
+        with self.assertRaisesRegex(RuntimeError,'calculation block changed'):
+            worker.enable_future_alerts(self.store,self.chain,self.adapter)
+
+
 def raw_transfer(token,sender,receiver,value):
     return dict(address=token,topics=[HexBytes('0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef'),
         HexBytes(bytes.fromhex(sender.removeprefix('0x')).rjust(32,b'\0')),HexBytes(bytes.fromhex(receiver.removeprefix('0x')).rjust(32,b'\0'))],

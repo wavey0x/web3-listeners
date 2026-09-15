@@ -1,6 +1,7 @@
 """One finalized fallback per stream; callers own their ordinary SQL rollback."""
 
 import logging
+import sqlite3
 import time
 
 from requests import RequestException
@@ -51,7 +52,8 @@ def block_reorg(store, w3, stream, previous, checkpoint):
     number = previous['next_block'] - 1
     if saved is not None:
         verify(w3, saved)
-        if not previous['initial_block'] - 1 <= saved['block'] <= number:
+        if (not previous['initial_block'] - 1 <= saved['block'] <= number
+                or saved['position'] != saved['block'] + 1):
             raise FatalError('Recovery point is outside the processed import range')
     if hex_value(w3.eth.get_block(number)['hash']) != previous['previous_hash']:
         verify(w3, saved)
@@ -75,6 +77,10 @@ def block_reorg(store, w3, stream, previous, checkpoint):
 
 
 def transient(error):
+    if isinstance(error, (FileNotFoundError, PermissionError)):
+        return False
+    if isinstance(error, sqlite3.OperationalError):
+        return (getattr(error, 'sqlite_errorcode', 0) & 0xff) in (sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED)
     return (isinstance(error, (ChainChanged, OSError, RequestException, Web3Exception))
             or (isinstance(error, ValueError) and error.args and isinstance(error.args[0], dict)))
 
@@ -99,5 +105,8 @@ def entrypoint(main):
         logger.error('Listener stopped: %s', error)
         raise SystemExit(78) from None
     except (RuntimeError, ValueError) as error:
+        if transient(error):
+            logger.warning('Listener startup retry (%s)', type(error).__name__)
+            raise SystemExit(1) from None
         logger.error('Listener state requires investigation (%s)', type(error).__name__)
         raise SystemExit(78) from None
