@@ -131,16 +131,46 @@ class CurveTests(unittest.TestCase):
         self.assert_no_history()
         self.assertEqual(self.state()['next_block'],13)
 
-    def test_every_eligible_vote_can_alert_without_a_delivery_ledger(self):
+    def test_batch_votes_emit_one_large_alert_per_block_without_a_delivery_ledger(self):
         self.seed()
         self.activate()
-        self.chain.logs=[vote(index=0),vote(index=1)]
+        self.chain.logs=[vote(index=index) for index in range(40)]
         self.scan()
-        self.assertEqual(self.count('curve_gauge_votes'),2)
-        self.assertEqual(len(self.sent),2)
+        self.assertEqual(self.count('curve_gauge_votes'),40)
+        self.assertEqual(self.count('curve_events'),40)
+        self.assertEqual(len(self.sent),1)
         self.assert_no_history()
         self.scan()
+        self.assertEqual(len(self.sent),1)
+
+    def test_large_alert_limit_is_per_block_not_per_scan_or_session(self):
+        self.seed(); self.activate()
+        self.chain.logs=[vote(block=block,index=index) for block in (10,11) for index in range(2)]
+        self.scan()
         self.assertEqual(len(self.sent),2)
+        self.assertEqual(self.count('curve_gauge_votes'),4)
+        self.chain.latest=14
+        self.chain.logs.extend(vote(block=14,index=index) for index in range(2))
+        self.scan()
+        self.assertEqual(len(self.sent),3)
+        self.assertEqual(self.count('curve_gauge_votes'),6)
+
+    def test_batch_limit_preserves_unknown_gauge_alerts(self):
+        self.seed(); self.activate()
+        self.chain.logs=[vote(index=index,gauge='unknown'+str(index)) for index in range(2)]
+        self.scan()
+        self.assertEqual([item[0] for item in self.sent],['WAVEY_ALERTS','YLOCKERS','WAVEY_ALERTS'])
+        self.assertEqual(self.count('curve_gauge_votes'),2)
+
+    def test_failed_batch_alert_does_not_try_each_remaining_vote(self):
+        self.seed(); self.activate()
+        self.chain.logs=[vote(index=index) for index in range(40)]
+        send=Mock(side_effect=TimeoutError('uncertain response'))
+        self.scan(send)
+        self.scan(send)
+        self.assertEqual(send.call_count,1)
+        self.assertEqual(self.count('curve_gauge_votes'),40)
+        self.assertEqual(self.state()['next_block'],13)
 
 
     def test_latest_vote_alert_does_not_wait_for_finality_or_repeat(self):

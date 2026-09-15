@@ -9,6 +9,9 @@ installed code, runtime, database and configuration; restored workers stay held.
 - Curve votes, retention and DAO follow `latest`, polling every two seconds when
   idle. Alerts are optimistic: duplicates and subsequently orphaned events are
   acceptable. Telegram delivery is best effort; failures log and indexing continues.
+- Curve indexes every gauge vote but emits at most one large-vote alert per block.
+  Batch voting can produce many qualifying events in one transaction. This limit
+  is local to the scanned batch; it needs no delivery history or schema change.
 - RSUP and YieldBasis reports run as soon as a completed week and its calculation
   block exist. They retain that block's hash and recheck it until finalized.
 - Liquid-locker harvests index finalized blocks and have no notification path.

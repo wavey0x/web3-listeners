@@ -227,15 +227,23 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
         if checkpoint(connection) != previous or notifications.state(connection, STREAM)['generation'] != generation:
             raise RuntimeError('Curve scan session or checkpoint advanced concurrently')
         claims = []
+        # Scans commit complete blocks, so the existing per-block alert limit
+        # only needs this batch-local set, not a durable delivery ledger.
+        alert_blocks = set()
         for item in items:
             if not connection.execute('INSERT INTO curve_events VALUES (?,?) ON CONFLICT(event_key) DO NOTHING',
                                       (item['key'], item['row']['block'])).rowcount:
                 continue
             insert_row(connection, item['row'])
             for kind, destination, message, per_block in alerts(item):
+                alert_block = (kind, destination, item['row']['block'])
+                if per_block and alert_block in alert_blocks:
+                    continue
                 claim = notifications.pending(connection, STREAM, generation, item['row']['block'], destination)
                 if claim:
                     claims.append((claim, message))
+                    if per_block:
+                        alert_blocks.add(alert_block)
         connection.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
         return claims
     claims = store.write(commit)
