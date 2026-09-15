@@ -73,6 +73,10 @@ class RetentionTests(unittest.TestCase):
         self.sent = []
         self.generation = 0
 
+    def assert_no_history(self):
+        self.assertEqual(self.store.read(lambda c: c.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('notification_decisions','notification_blocks')").fetchone()[0]), 0)
+
     def seed(self, start=10):
         def write(c):
             c.execute('INSERT INTO retention_checkpoint VALUES (?,?,?,?,?)',('retention',1,start,start,retention.hex_value(block_hash(start-1))))
@@ -110,7 +114,7 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(row['old_weight'],str(10**76+7))
         self.assertEqual(row['new_weight'],str(10**75+3))
         self.assertEqual(row['weight_diff'],str(-9*10**75-4))
-        self.assertEqual(self.rows('notification_decisions')[0]['status'],'suppressed')
+        self.assert_no_history()
         self.assertEqual(self.sent,[])
         self.assertEqual(self.state()['next_block'],13)
         self.assertFalse(self.scan())
@@ -143,7 +147,7 @@ class RetentionTests(unittest.TestCase):
             return result
         with patch.object(retention,'insert_row',side_effect=fail),self.assertRaisesRegex(RuntimeError,'failed insert'):
             self.scan()
-        for table in ('weight_changes','retention_events','notification_decisions'):
+        for table in ('weight_changes','retention_events'):
             self.assertEqual(self.rows(table),[])
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.sent,[])
@@ -170,22 +174,21 @@ class RetentionTests(unittest.TestCase):
         self.scan()
         self.assertEqual(len(self.rows('weight_changes')),1)
         self.assertEqual(len(self.rows('retention_events')),1)
-        self.assertEqual(self.rows('notification_decisions'),[])
+        self.assert_no_history()
         self.assertEqual(self.sent,[])
 
-    def test_uncertain_send_does_not_retry_or_drain_other_claims(self):
+    def test_sending_failure_does_not_discard_other_alerts(self):
         self.seed()
         self.activate()
         self.chain.logs=[weight(index=0),weight(index=1)]
         def timeout(*args):
             self.send(*args)
             raise TimeoutError('uncertain response')
-        with self.assertRaisesRegex(RuntimeError,'automatic retry is disabled'):
-            self.scan(timeout)
+        self.scan(timeout)
         self.generation=notifications.start_session(self.store,'retention',14,retention.hex_value(block_hash(14)))
         self.scan(timeout)
-        self.assertEqual(len(self.sent),1)
-        self.assertEqual([r['status'] for r in self.rows('notification_decisions')],['uncertain','claimed'])
+        self.assertEqual(len(self.sent),2)
+        self.assert_no_history()
 
     def test_restart_suppresses_outage_and_allows_new_changes(self):
         self.seed()
@@ -195,7 +198,7 @@ class RetentionTests(unittest.TestCase):
         self.chain.logs=[weight(block=15),weight(block=21)]
         self.scan()
         self.assertEqual(len(self.sent),1)
-        self.assertEqual([r['status'] for r in self.rows('notification_decisions')],['suppressed','delivered'])
+        self.assert_no_history()
 
     def test_missing_checkpoint_rpc_failure_and_reorg_fail_closed(self):
         with self.assertRaisesRegex(RuntimeError,'checkpoint missing'):
@@ -206,7 +209,7 @@ class RetentionTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[9]=block_hash(99)
-        with self.assertRaisesRegex(RuntimeError,'checkpoint block changed'):
+        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
             self.scan()
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.rows('retention_events'),[])
@@ -222,7 +225,7 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.rows('weight_changes')[:2],before)
         self.assertEqual(len(self.rows('weight_changes')),3)
         self.assertEqual(len(self.rows('retention_events')),2)
-        self.assertEqual(self.rows('notification_decisions'),[])
+        self.assert_no_history()
 
     def test_mismatched_import_never_adopts(self):
         self.chain.logs=[weight()]
@@ -261,6 +264,21 @@ class RetentionTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'concurrently'):
             self.scan()
         self.assertEqual(self.state()['next_block'],5010)
+
+
+    def test_reorg_replaces_only_unfinalized_weights(self):
+        self.seed(); self.activate(); self.chain.logs=[weight(block=10)]; self.scan()
+        original=self.rows('weight_changes')[0]
+        self.chain.latest=14; self.chain.logs.append(weight(block=14,new=1)); self.scan()
+        self.chain.hash_changes[14]=block_hash(9999)
+        replacement=weight(block=14,new=2); replacement['blockHash']=block_hash(9999)
+        self.chain.logs=[weight(block=10),replacement]
+        self.scan(); self.scan()
+        rows=self.rows('weight_changes')
+        self.assertEqual(rows[0],original)
+        self.assertEqual(rows[1]['new_weight'],'2')
+        self.assertEqual(self.state()['next_block'],15)
+        self.assert_no_history()
 
 
 if __name__ == '__main__':

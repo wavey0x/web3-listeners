@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlite_store import Store
 import notifications
+import recovery
 
 logger = logging.getLogger(__name__)
 
@@ -117,13 +118,13 @@ def collect(w3, controller, ve, gauges, start, end):
         if block not in blocks:
             blocks[block] = w3.eth.get_block(block)
         if hex_value(blocks[block]['hash']) != hex_value(log['blockHash']):
-            raise RuntimeError('Curve vote block changed during collection')
+            raise recovery.ChainChanged('Curve vote block changed during collection')
         tx = hex_value(log['transactionHash'])
         if tx not in receipts:
             receipts[tx] = w3.eth.get_transaction_receipt(log['transactionHash'])
         receipt = receipts[tx]
         if hex_value(receipt['blockHash']) != hex_value(log['blockHash']) or hex_value(receipt['transactionHash']) != tx:
-            raise RuntimeError('Curve vote receipt changed during collection')
+            raise recovery.ChainChanged('Curve vote receipt changed during collection')
         positions = [i for i, item in enumerate(receipt['logs']) if item['logIndex'] == log['logIndex']
                      and hex_value(item['address']) == hex_value(GAUGE_CONTROLLER_ADDRESS)]
         if len(positions) != 1:
@@ -139,7 +140,7 @@ def collect(w3, controller, ve, gauges, start, end):
         items.append(dict(key=f'1:{GAUGE_CONTROLLER_ADDRESS.lower()}:{tx}:{positions[0]}', row=row,
                           legacy_amount=amount_text(balance, weight, legacy=True), unknown=gauge.lower() not in names))
     if hex_value(w3.eth.get_block(end)['hash']) != end_hash:
-        raise RuntimeError('Curve range changed during collection')
+        raise recovery.ChainChanged('Curve range changed during collection')
     return items, end_hash
 
 
@@ -203,15 +204,25 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
     if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
         raise RuntimeError('Curve checkpoint chain does not match RPC')
     start = previous['next_block']
-    if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
-        raise RuntimeError('Curve checkpoint block changed; reconciliation required')
+    saved = recovery.block_reorg(store, w3, STREAM, previous, checkpoint)
+    if saved is not None:
+        def rewind(c):
+            if checkpoint(c) != previous or notifications.state(c, STREAM)['generation'] != generation:
+                raise recovery.ChainChanged('Checkpoint or session advanced concurrently')
+            c.execute('DELETE FROM curve_gauge_votes WHERE block>?', (saved['block'],))
+            c.execute('DELETE FROM curve_events WHERE block>?', (saved['block'],))
+            c.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',
+                      (saved['position'], saved['block_hash'], STREAM))
+        store.write(rewind)
+        logger.warning('%s rewound to finalized block %s', STREAM, saved['block'])
+        return True
     height = w3.eth.get_block('latest')['number']
     if start > height:
         return
     end = min(start + CHUNK_SIZE - 1, height)
     items, block_hash = collect(w3, controller, ve, gauges, start, end)
     if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
-        raise RuntimeError('Curve checkpoint block changed during collection')
+        raise recovery.ChainChanged('Curve checkpoint block changed during collection')
     def commit(connection):
         if checkpoint(connection) != previous or notifications.state(connection, STREAM)['generation'] != generation:
             raise RuntimeError('Curve scan session or checkpoint advanced concurrently')
@@ -222,8 +233,7 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
                 continue
             insert_row(connection, item['row'])
             for kind, destination, message, per_block in alerts(item):
-                claim = notifications.decide(connection, STREAM, generation, item['key'], item['row']['block'],
-                                             kind, destination, message, once_per_block=per_block)
+                claim = notifications.pending(connection, STREAM, generation, item['row']['block'], destination)
                 if claim:
                     claims.append((claim, message))
         connection.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
@@ -294,11 +304,11 @@ def main():
     latest = w3.eth.get_block('latest')
     generation = notifications.start_session(store, STREAM, latest['number'], hex_value(latest['hash']))
     while True:
-        scan_once(store, w3, controller, ve, gauges, generation, notifications.send_telegram)
+        recovery.attempt(lambda: scan_once(store, w3, controller, ve, gauges, generation, notifications.send_telegram))
         if args.once:
             return
         time.sleep(POLL_INTERVAL)
 
 
 if __name__ == '__main__':
-    main()
+    recovery.entrypoint(main)

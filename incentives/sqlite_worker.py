@@ -8,6 +8,7 @@ import os
 import time
 
 import notifications
+import recovery
 from sqlite_store import Store
 from incentives.incentives_shared import WEEK
 
@@ -34,6 +35,7 @@ def prepare(store):
         c.execute('''CREATE TABLE incentive_events (
             protocol TEXT NOT NULL,event_key TEXT NOT NULL,period_start INTEGER NOT NULL,block INTEGER NOT NULL,
             PRIMARY KEY(protocol,event_key))''')
+        c.execute('CREATE TABLE incentive_calculations (protocol TEXT PRIMARY KEY,block INTEGER NOT NULL,block_hash TEXT NOT NULL)')
         c.execute("INSERT INTO _migration_meta VALUES ('incentive_schema_version','1')")
     store.write(create)
 
@@ -91,13 +93,13 @@ def collect(adapter,w3,period,head):
             blocks[number]=w3.eth.get_block(number)
         block=blocks[number]
         if hex_value(block['hash'])!=hex_value(log['blockHash']) or not period<=block['timestamp']<period+WEEK:
-            raise RuntimeError('Incentive event changed or falls outside its period')
+            raise recovery.ChainChanged('Incentive event changed or falls outside its period')
         tx=hex_value(log['transactionHash'])
         if tx not in receipts:
             receipts[tx]=w3.eth.get_transaction_receipt(log['transactionHash'])
         receipt=receipts[tx]
         if hex_value(receipt['blockHash'])!=hex_value(log['blockHash']) or hex_value(receipt['transactionHash'])!=tx:
-            raise RuntimeError('Incentive receipt changed during collection')
+            raise recovery.ChainChanged('Incentive receipt changed during collection')
         positions=[i for i,item in enumerate(receipt['logs']) if item['logIndex']==log['logIndex']
                    and hex_value(item['address'])==hex_value(adapter.TOKEN)]
         if len(positions)!=1:
@@ -110,7 +112,7 @@ def collect(adapter,w3,period,head):
         items.append(dict(key=identity,event=log,block=block,receipt=receipt,effective_block=effective))
     if (hex_value(w3.eth.get_block(end)['hash'])!=end_hash
             or hex_value(w3.eth.get_block(effective)['hash'])!=effective_hash):
-        raise RuntimeError('Incentive range changed during collection')
+        raise recovery.ChainChanged('Incentive range changed during collection')
     return items,end,end_hash,effective,effective_hash
 
 
@@ -160,7 +162,7 @@ def adopt_boundary(store,w3,adapter):
         next_period=period+WEEK
         if (hex_value(w3.eth.get_block(end)['hash'])!=end_hash
                 or hex_value(w3.eth.get_block(effective)['hash'])!=effective_hash):
-            raise RuntimeError('Incentive boundary changed while calculating missing observations')
+            raise recovery.ChainChanged('Incentive boundary changed while calculating missing observations')
     else:
         from incentives.config import INCENTIVE_START_TIMESTAMPS
         period=INCENTIVE_START_TIMESTAMPS[adapter.PROTOCOL]//WEEK*WEEK
@@ -172,6 +174,7 @@ def adopt_boundary(store,w3,adapter):
         c.execute('INSERT INTO incentive_checkpoints VALUES (?,?,?,?,?,?)',
             (adapter.PROTOCOL,1,period,next_period,end,end_hash))
         notifications.add_stream(c,adapter.STREAM,end,end_hash)
+        save_calculation(c, adapter.PROTOCOL, effective if rows else end, effective_hash if rows else end_hash)
         for item in items:
             c.execute('INSERT INTO incentive_events VALUES (?,?,?,?)',(adapter.PROTOCOL,item['key'],period,item['event']['blockNumber']))
             if item['row'] is not None:
@@ -181,12 +184,61 @@ def adopt_boundary(store,w3,adapter):
     return store.write(adopt)
 
 
+def save_calculation(c, protocol, block, block_hash):
+    c.execute('''INSERT INTO incentive_calculations VALUES (?,?,?) ON CONFLICT(protocol)
+        DO UPDATE SET block=excluded.block,block_hash=excluded.block_hash''', (protocol,block,block_hash))
+
+
+def reconcile(store, w3, adapter, previous, generation):
+    saved = store.read(lambda c: recovery.point(c, adapter.STREAM))
+    if saved is not None:
+        recovery.verify(w3, saved)
+    observed = store.read(lambda c: c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
+                                             (adapter.PROTOCOL,)).fetchone())
+    calculation = dict(observed) if observed is not None else dict(
+        block=previous['previous_block'], block_hash=previous['previous_hash'])
+    valid = (hex_value(w3.eth.get_block(previous['previous_block'])['hash']) == previous['previous_hash']
+             and hex_value(w3.eth.get_block(calculation['block'])['hash']) == calculation['block_hash'])
+    if not valid:
+        recovery.verify(w3, saved)
+        if not previous['initial_period'] <= saved['position'] <= previous['next_period']:
+            raise recovery.FatalError('Incentive recovery point is outside processed periods')
+        def rewind(c):
+            if (checkpoint(c, adapter.PROTOCOL) != previous
+                    or notifications.state(c, adapter.STREAM)['generation'] != generation):
+                raise recovery.ChainChanged('Incentive checkpoint or session advanced during recovery')
+            c.execute('DELETE FROM incentives WHERE protocol=? AND period_start>=?',
+                      (adapter.PROTOCOL, saved['position']))
+            c.execute('DELETE FROM incentive_events WHERE protocol=? AND period_start>=?',
+                      (adapter.PROTOCOL, saved['position']))
+            c.execute('UPDATE incentive_checkpoints SET next_period=?,previous_block=?,previous_hash=? WHERE protocol=?',
+                      (saved['position'], saved['block'], saved['block_hash'], adapter.PROTOCOL))
+            save_calculation(c, adapter.PROTOCOL, saved['block'], saved['block_hash'])
+        store.write(rewind)
+        return True
+    finalized = w3.eth.get_block('finalized')['number']
+    if observed is None and calculation['block'] > finalized:
+        raise recovery.FatalError('Existing incentive baseline must be finalized before migration')
+    if calculation['block'] <= finalized and (saved is None or previous['next_period'] > saved['position']):
+        if (hex_value(w3.eth.get_block(calculation['block'])['hash']) != calculation['block_hash']
+                or hex_value(w3.eth.get_block(previous['previous_block'])['hash']) != previous['previous_hash']):
+            raise recovery.ChainChanged('Incentive chain changed while advancing recovery point')
+        def promote(c):
+            if checkpoint(c, adapter.PROTOCOL) != previous or recovery.point(c, adapter.STREAM) != saved:
+                raise recovery.ChainChanged('Incentive checkpoint advanced concurrently')
+            recovery.save(c, adapter.STREAM, calculation['block'], calculation['block_hash'], previous['next_period'])
+        store.write(promote)
+    elif saved is None:
+        raise recovery.FatalError('Finalized incentive recovery point missing')
+    return False
+
+
 def scan_once(store,w3,adapter,generation,send):
     previous=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))
     if w3.eth.chain_id!=1 or previous['chain_id']!=1:
         raise RuntimeError('Incentive checkpoint chain does not match RPC')
-    if hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']:
-        raise RuntimeError('Incentive checkpoint block changed; reconciliation required')
+    if reconcile(store, w3, adapter, previous, generation):
+        return True
     head=w3.eth.get_block('latest')
     period=previous['next_period']
     if head['timestamp']<=period+WEEK:
@@ -198,7 +250,7 @@ def scan_once(store,w3,adapter,generation,send):
     if (hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']
             or hex_value(w3.eth.get_block(end)['hash'])!=end_hash
             or hex_value(w3.eth.get_block(effective)['hash'])!=effective_hash):
-        raise RuntimeError('Incentive range changed while calculating observations')
+        raise recovery.ChainChanged('Incentive range changed while calculating observations')
     from incentives.config import resolve_chat_id
     chat_id,destination=resolve_chat_id(adapter.PROTOCOL)
     if not chat_id:
@@ -215,12 +267,12 @@ def scan_once(store,w3,adapter,generation,send):
                 continue
             insert_row(c,item['row'])
             message=adapter.render_message(item['row'])
-            claim=notifications.decide(c,adapter.STREAM,generation,item['key'],item['event']['blockNumber'],
-                                       'incentive-report',destination,message)
+            claim=notifications.pending(c,adapter.STREAM,generation,item['event']['blockNumber'],destination)
             if claim:
                 claims.append((claim,message))
         c.execute('UPDATE incentive_checkpoints SET next_period=?,previous_block=?,previous_hash=? WHERE protocol=?',
                   (period+WEEK,end,end_hash,adapter.PROTOCOL))
+        save_calculation(c, adapter.PROTOCOL, effective, effective_hash)
         return claims
     for claim,message in store.write(commit):
         notifications.dispatch(store,claim,message,send)
@@ -258,12 +310,14 @@ def run(store,w3,adapter,*,once=False):
     latest=w3.eth.get_block('latest')
     generation=notifications.start_session(store,adapter.STREAM,latest['number'],hex_value(latest['hash']))
     while True:
-        progressed=scan_once(store,w3,adapter,generation,notifications.send_telegram)
+        progressed=recovery.attempt(lambda: scan_once(store,w3,adapter,generation,notifications.send_telegram))
         if once:
             return
         if not progressed:
             next_period=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))['next_period']
-            time.sleep(poll_delay(next_period,time.time(),adapter.POLL_INTERVAL))
+            saved=store.read(lambda c: recovery.point(c,adapter.STREAM))
+            pending=saved is None or saved['position']<next_period
+            time.sleep(2 if pending else poll_delay(next_period,time.time(),adapter.POLL_INTERVAL))
 
 
 def main(adapter):

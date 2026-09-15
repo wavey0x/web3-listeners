@@ -94,6 +94,10 @@ class IncentiveTests(unittest.TestCase):
         self.generation=0
         self.sent=[]
 
+    def assert_no_history(self):
+        self.assertEqual(self.store.read(lambda c: c.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('notification_decisions','notification_blocks')").fetchone()[0]), 0)
+
     def seed(self,adapter=None,period=PERIOD):
         adapter=adapter or self.adapter
         previous=period//(WEEK//10)-1
@@ -141,7 +145,7 @@ class IncentiveTests(unittest.TestCase):
         self.assertEqual(result['matched_events'],1)
         self.assertEqual(self.rows('incentives'),original)
         self.assertEqual(self.state()['next_period'],PERIOD+WEEK)
-        self.assertEqual(self.rows('notification_decisions'),[])
+        self.assert_no_history()
         self.adapter.build_record.assert_not_called()
 
     def test_boundary_adds_missing_event_and_rejects_unmatched_import(self):
@@ -178,7 +182,7 @@ class IncentiveTests(unittest.TestCase):
         self.scan()
         self.assertEqual([row['protocol'] for row in self.rows('incentives')],['resupply'])
         self.assertEqual(self.state(other)['next_period'],PERIOD)
-        self.assertEqual(self.rows('notification_decisions')[0]['status'],'suppressed')
+        self.assert_no_history()
         self.assertEqual(self.sent,[])
 
     def test_yb_transaction_grouping_survives_repeated_input(self):
@@ -238,7 +242,7 @@ class IncentiveTests(unittest.TestCase):
                 raise RuntimeError('failed insert')
         with patch.object(worker,'insert_row',side_effect=fail),self.assertRaisesRegex(RuntimeError,'failed insert'):
             self.scan()
-        for table in ('incentives','incentive_events','notification_decisions'):
+        for table in ('incentives','incentive_events'):
             self.assertEqual(self.rows(table),[])
         self.adapter.build_record.side_effect=OSError('calculation failed')
         with self.assertRaisesRegex(OSError,'calculation failed'):
@@ -246,21 +250,20 @@ class IncentiveTests(unittest.TestCase):
         self.assertEqual(self.state()['next_period'],PERIOD)
         self.assertEqual(self.sent,[])
 
-    def test_uncertain_delivery_restart_and_outage_do_not_replay(self):
+    def test_sending_failure_preserves_period_and_quiet_restart(self):
         self.seed()
         self.activate()
         self.chain.logs=[transfer(self.adapter.TOKEN)]
         def timeout(*args):
             self.send(*args)
             raise TimeoutError('uncertain')
-        with self.assertRaisesRegex(RuntimeError,'automatic retry is disabled'):
-            self.scan(timeout)
+        self.scan(timeout)
         self.chain.height=1022
         self.chain.logs.append(transfer(self.adapter.TOKEN,block=1015))
         self.generation=notifications.start_session(self.store,self.adapter.STREAM,1020,worker.hex_value(block_hash(1020)))
         self.scan(timeout)
         self.assertEqual(len(self.sent),1)
-        self.assertEqual([row['status'] for row in self.rows('notification_decisions')],['uncertain','suppressed'])
+        self.assert_no_history()
 
     def test_missing_progress_rpc_reorg_and_stale_worker_fail_closed(self):
         with self.assertRaisesRegex(RuntimeError,'checkpoint missing'):
@@ -271,7 +274,7 @@ class IncentiveTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[999]=block_hash(555)
-        with self.assertRaisesRegex(RuntimeError,'checkpoint block changed'):
+        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
             self.scan()
         self.chain.hash_changes.clear()
         notifications.start_session(self.store,self.adapter.STREAM,1014,worker.hex_value(block_hash(1014)))
@@ -305,7 +308,40 @@ class IncentiveTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError,'exactly once'):
             corrections.apply_updates(self.store,after,[update,update])
         self.assertEqual(self.store.read(corrections.read_rows),after)
-        self.assertEqual(self.rows('notification_decisions'),[])
+        self.assert_no_history()
+
+    def test_calculation_block_reorg_recomputes_period_before_finality(self):
+        self.seed(); self.activate()
+        self.chain.height=1005; self.chain.latest=1011
+        self.chain.logs=[transfer(self.adapter.TOKEN)]
+        self.scan()
+        self.assertEqual(self.state()['previous_block'],1009)
+        self.assertEqual(self.rows('incentive_calculations')[0]['block'],1011)
+        self.chain.hash_changes[1011]=block_hash(9999)  # End-block hash is unchanged.
+        self.scan()
+        self.assertEqual(self.state()['next_period'],PERIOD)
+        self.assertEqual(self.rows('incentives'),[])
+        self.scan()
+        self.assertEqual(self.adapter.build_record.call_count,2)
+        self.assertEqual(len(self.rows('incentives')),1)
+        self.assertEqual(len(self.sent),2)
+        self.assert_no_history()
+
+    def test_finalized_period_and_other_protocol_survive_next_period_reorg(self):
+        other=self.chain.adapter('yieldbasis')
+        self.seed(); self.seed(other); self.activate()
+        self.chain.logs=[transfer(self.adapter.TOKEN),transfer(other.TOKEN)]
+        self.scan()
+        worker.scan_once(self.store,self.chain,other,0,self.send)
+        original=self.rows('incentives')
+        self.scan()  # Finalize the processed first week.
+        self.chain.latest=1021
+        self.chain.logs.append(transfer(self.adapter.TOKEN,block=1015))
+        self.scan()
+        self.chain.hash_changes[1021]=block_hash(9999)
+        self.scan()
+        self.assertEqual(self.rows('incentives'),original)
+        self.assertEqual(self.state()['next_period'],PERIOD+WEEK)
 
 
 def raw_transfer(token,sender,receiver,value):

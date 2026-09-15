@@ -8,6 +8,7 @@ import threading
 
 from sqlite_store import Store
 import notifications
+import recovery
 
 logger=logging.getLogger(__name__)
 WORKERS={
@@ -46,6 +47,10 @@ def run_worker(name,entry,stop):
             entry()
             raise RuntimeError('Worker returned unexpectedly')
         except Exception as error:
+            if not recovery.transient(error):
+                logger.error('%s requires operator action (%s)', name, type(error).__name__)
+                stop.set()
+                return
             # RPC exceptions can contain credentials. Keep their details out of supervisor logs.
             logger.error('%s stopped (%s); restarting after 60 seconds',name,type(error).__name__)
             if stop.wait(60):
@@ -75,7 +80,8 @@ def main():
                 raise RuntimeError('A Resupply worker exited outside its restart handler')
     finally:
         stop.set()
+    raise recovery.FatalError('A Resupply worker stopped; inspect its named error and repair before restarting')
 
 
 if __name__=='__main__':
-    main()
+    recovery.entrypoint(main)

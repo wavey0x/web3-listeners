@@ -13,6 +13,7 @@ import time
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
 from sqlite_store import Store
 import notifications
+import recovery
 
 logger = logging.getLogger(__name__)
 POLL_INTERVAL = 2
@@ -77,7 +78,7 @@ def contract_identity(contracts):
     return json.dumps(sorted(address.lower() for address in contracts))
 
 
-def collect(w3,contracts,start,end):
+def collect(w3,contracts,start,end, *, proposals=None):
     end_hash=hex_value(w3.eth.get_block(end)['hash'])
     raw=[]
     for address,contract in contracts.items():
@@ -87,19 +88,22 @@ def collect(w3,contracts,start,end):
     blocks,receipts,descriptions,items={},{},{},[]
     for event,name,address,contract in sorted(raw,key=lambda value:(value[0]['blockNumber'],value[0]['logIndex'])):
         number=event['blockNumber']
+        proposal=str(event['args']['id'] if name in ('ProposalCreated','VoteCast') else event['args']['proposalId'])
+        if proposals is not None and (address.lower(),proposal) not in proposals:
+            continue
         if not start<=number<=end or event.get('removed',False) or hex_value(event['address'])!=hex_value(address):
             raise RuntimeError('RPC returned an invalid DAO event')
         if number not in blocks:
             blocks[number]=w3.eth.get_block(number)
         block=blocks[number]
         if hex_value(block['hash'])!=hex_value(event['blockHash']):
-            raise RuntimeError('DAO event block changed during collection')
+            raise recovery.ChainChanged('DAO event block changed during collection')
         tx=hex_value(event['transactionHash'])
         if tx not in receipts:
             receipts[tx]=w3.eth.get_transaction_receipt(event['transactionHash'])
         receipt=receipts[tx]
         if hex_value(receipt['blockHash'])!=hex_value(event['blockHash']) or hex_value(receipt['transactionHash'])!=tx:
-            raise RuntimeError('DAO receipt changed during collection')
+            raise recovery.ChainChanged('DAO receipt changed during collection')
         positions=[i for i,log in enumerate(receipt['logs']) if log['logIndex']==event['logIndex']
                    and hex_value(log['address'])==hex_value(address)]
         if len(positions)!=1:
@@ -113,7 +117,7 @@ def collect(w3,contracts,start,end):
         items.append(dict(key=f'1:{address.lower()}:{tx}:{positions[0]}',event=event,name=name,address=address,
                           proposal=proposal,block=block,description=description))
     if hex_value(w3.eth.get_block(end)['hash'])!=end_hash:
-        raise RuntimeError('DAO range changed during collection')
+        raise recovery.ChainChanged('DAO range changed during collection')
     return items,end_hash
 
 
@@ -231,7 +235,7 @@ def record_events(c,items,generation=None):
             continue
         message=apply_event(c,item,used_legacy_votes)
         if message is not None and generation is not None:
-            claim=notifications.decide(c,STREAM,generation,item['key'],item['event']['blockNumber'],item['name'],'RESUPPLY_ALERTS',message)
+            claim=notifications.pending(c,STREAM,generation,item['event']['blockNumber'],'RESUPPLY_ALERTS')
             if claim:
                 claims.append((claim,message))
     return claims
@@ -259,20 +263,103 @@ def adopt_boundary(store,w3,contracts):
     return store.write(adopt)
 
 
+def rebuild_proposal(original, items, timestamp):
+    """Rebuild current fields from canonical events; imported vote rows stay intact."""
+    created = [item for item in items if item['name'] == 'ProposalCreated']
+    if len(created) != 1:
+        raise recovery.FatalError('Cannot reconstruct DAO proposal creation at recovery point')
+    row = dict(original, yes_votes=0., no_votes=0., status='open', execution_time=None)
+    for item in items:
+        args, name = item['event']['args'], item['name']
+        number, when = item['event']['blockNumber'], item['block']['timestamp']
+        if name == 'VoteCast':
+            row['yes_votes'] += float(args['weightYes'])
+            row['no_votes'] += float(args['weightNo'])
+            row['last_updated'] = number
+            continue
+        row.update(block=number, txn_hash=item['event']['transactionHash'].hex(), timestamp=when,
+                   date_str=date_string(when), last_updated=number)
+        if name == 'ProposalCreated':
+            row.update(proposer=args['account'], description=item['description'], start_time=when,
+                       end_time=when+VOTING_PERIOD, quorum=args['quorumWeight'])
+        elif name == 'ProposalDescriptionUpdated':
+            row['description'] = item['description']
+        elif name == 'ProposalExecuted':
+            row.update(status='executed', execution_time=when)
+        elif name == 'ProposalCancelled':
+            row['status'] = 'cancelled'
+    row['status'] = current_status(row, timestamp)
+    return row
+
+
+def rewind(store, w3, contracts, previous, saved, generation):
+    rows = store.read(lambda c: [dict(row) for row in c.execute('SELECT * FROM resupply_proposals ORDER BY id')])
+    affected = store.read(lambda c: {(row[0].lower(), row[1]) for row in c.execute(
+        'SELECT voter_address,proposal_id FROM dao_events WHERE block>?', (saved['block'],))})
+    boundary = w3.eth.get_block(saved['block'])
+    rebuilt, removed = [], []
+    for original in rows:
+        key = (original['voter_address'].lower(), original['proposal_id'])
+        if original['start_time'] > boundary['timestamp']:
+            removed.append(original['id'])
+            continue
+        row = dict(original)
+        if key in affected or row['block'] > saved['block']:
+            # Locate creation by its immutable timestamp, then replay only this proposal.
+            low, high = 0, saved['block']
+            while low < high:
+                middle = (low + high) // 2
+                if w3.eth.get_block(middle)['timestamp'] < row['start_time']:
+                    low = middle + 1
+                else:
+                    high = middle
+            items = []
+            for start in range(low, saved['block'] + 1, CHUNK_SIZE):
+                batch, _ = collect(w3, contracts, start, min(start+CHUNK_SIZE-1, saved['block']), proposals={key})
+                items.extend(batch)
+            row = rebuild_proposal(row, items, boundary['timestamp'])
+        elif row['status'] not in ('executed', 'cancelled'):
+            row['status'] = current_status(dict(row, status='open'), boundary['timestamp'])
+        # Re-establish reminder conditions quietly after catch-up.
+        row['ending_soon_alert_sent'] = 0
+        rebuilt.append(row)
+    recovery.verify(w3, saved)
+    def commit(c):
+        if checkpoint(c) != previous or notifications.state(c, STREAM)['generation'] != generation:
+            raise recovery.ChainChanged('DAO checkpoint or session advanced during recovery')
+        c.execute('DELETE FROM resupply_votes WHERE block>?', (saved['block'],))
+        c.execute('DELETE FROM dao_events WHERE block>?', (saved['block'],))
+        c.execute('DELETE FROM resupply_scanner_progress WHERE last_scanned_block>?', (saved['block'],))
+        for identity in removed:
+            c.execute('DELETE FROM resupply_proposals WHERE id=?', (identity,))
+        for row in rebuilt:
+            fields = [key for key in row if key != 'id']
+            c.execute('UPDATE resupply_proposals SET '+','.join(key+'=?' for key in fields)+' WHERE id=?',
+                      (*[row[key] for key in fields], row['id']))
+        c.execute('DELETE FROM dao_poll_checkpoint WHERE stream=?', (STREAM,))
+        c.execute('DELETE FROM dao_poll_state')
+        c.execute('UPDATE dao_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',
+                  (saved['position'], saved['block_hash'], STREAM))
+    store.write(commit)
+    logger.warning('DAO rewound to finalized block %s', saved['block'])
+
+
 def scan_once(store,w3,contracts,generation,send):
     previous=store.read(checkpoint)
     if w3.eth.chain_id!=1 or previous['chain_id']!=1 or previous['contracts']!=contract_identity(contracts):
         raise RuntimeError('DAO chain or voter contracts differ from the adopted checkpoint')
     start=previous['next_block']
-    if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
-        raise RuntimeError('DAO checkpoint block changed; reconciliation required')
+    saved = recovery.block_reorg(store, w3, STREAM, previous, checkpoint)
+    if saved is not None:
+        rewind(store, w3, contracts, previous, saved, generation)
+        return True
     head=w3.eth.get_block('latest')
     if start>head['number']:
         return False
     end=min(start+CHUNK_SIZE-1,head['number'])
     items,block_hash=collect(w3,contracts,start,end)
     if hex_value(w3.eth.get_block(start-1)['hash'])!=previous['previous_hash']:
-        raise RuntimeError('DAO checkpoint changed during collection')
+        raise recovery.ChainChanged('DAO checkpoint changed during collection')
     def commit(c):
         if checkpoint(c)!=previous or notifications.state(c,STREAM)['generation']!=generation:
             raise RuntimeError('DAO checkpoint or session advanced concurrently')
@@ -340,9 +427,9 @@ def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
         if not baseline and (saved is None or saved['generation']!=generation):
             raise RuntimeError('DAO polling needs an explicit quiet baseline for this session')
         if saved is not None and (now<saved['observed_at'] or head['number']<saved['block']):
-            raise RuntimeError('DAO polling head moved backwards; reconciliation required')
+            raise recovery.ChainChanged('DAO polling head moved backwards; reconciliation required')
         if previous['next_block']==head['number']+1 and previous['previous_hash']!=hex_value(head['hash']):
-            raise RuntimeError('DAO polling head differs from its indexed checkpoint')
+            raise recovery.ChainChanged('DAO polling head differs from its indexed checkpoint')
         claims=[]
         for record in c.execute('SELECT * FROM resupply_proposals ORDER BY id').fetchall():
             row=dict(record)
@@ -373,8 +460,7 @@ def poll_statuses(store,w3,generation,send,*,baseline=False,activate=False):
                 (address,row['proposal_id'],status,int(consumed),now))
             for kind in kinds:
                 message=status_message(row,kind)
-                claim=notifications.decide(c,STREAM,generation,f'proposal:{address}:{row["proposal_id"]}',head['number'],
-                                           kind,'RESUPPLY_ALERTS',message)
+                claim=notifications.pending(c,STREAM,generation,head['number'],'RESUPPLY_ALERTS')
                 if claim:
                     claims.append((claim,message))
         c.execute('''INSERT INTO dao_poll_checkpoint VALUES (?,?,?,?,?) ON CONFLICT(stream)
@@ -413,10 +499,12 @@ def run(store,w3,contracts,*,once=False):
     generation=notifications.start_session(store,STREAM,latest['number'],hex_value(latest['hash']))
     baseline_needed=True
     while True:
-        progressed=scan_once(store,w3,contracts,generation,notifications.send_telegram)
+        progressed=recovery.attempt(lambda: scan_once(store,w3,contracts,generation,notifications.send_telegram))
         # Poll only when all event types and contracts have reached the same latest head.
-        if not progressed:
-            if poll_statuses(store,w3,generation,notifications.send_telegram,baseline=baseline_needed):
+        if progressed is False:
+            baseline_needed = baseline_needed or store.read(lambda c: c.execute(
+                'SELECT 1 FROM dao_poll_checkpoint WHERE stream=?', (STREAM,)).fetchone() is None)
+            if recovery.attempt(lambda: poll_statuses(store,w3,generation,notifications.send_telegram,baseline=baseline_needed)):
                 baseline_needed=False
         if once:
             return
@@ -462,4 +550,4 @@ def cli():
 
 
 if __name__=='__main__':
-    cli()
+    recovery.entrypoint(cli)

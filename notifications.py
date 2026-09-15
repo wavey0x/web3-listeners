@@ -1,7 +1,6 @@
-"""Persistent suppression and at most one public send attempt. There is no queue."""
+"""Best-effort alerts with stream mute/activation controls, without delivery history."""
 
 from dataclasses import dataclass
-import hashlib
 import json
 import logging
 import os
@@ -9,46 +8,30 @@ from pathlib import Path
 import re
 import stat
 
+import recovery
+
 logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
-class Claim:
+class Pending:
     stream: str
-    event_key: str
-    kind: str
+    generation: int
+    block: int
     destination: str
-
-    def key(self):
-        return (self.stream, self.event_key, self.kind, self.destination)
 
 
 def prepare(connection):
-    """Called only by explicit inactive-import preparation, never normal startup."""
+    """Prepare an inactive import; live upgrades use the explicit migration."""
     manifest = json.loads(connection.execute("SELECT value FROM _migration_meta WHERE key='manifest'").fetchone()[0])
     if manifest.get('application_ready') or manifest.get('alerts_enabled') is not False:
         raise RuntimeError('Prepare notification state in an inactive, muted import')
-    version = connection.execute("SELECT value FROM _migration_meta WHERE key='notification_schema_version'").fetchone()
-    if version:
-        if version[0] != '1':
-            raise RuntimeError('Unsupported notification schema version')
-        connection.execute('SELECT stream,enabled,floor_block,floor_hash,generation FROM notification_streams LIMIT 0')
-        connection.execute('SELECT status,message_hash,generation FROM notification_decisions LIMIT 0')
-        connection.execute('SELECT event_key FROM notification_blocks LIMIT 0')
-        return
-    connection.execute('''CREATE TABLE notification_streams (
+    connection.execute("""CREATE TABLE IF NOT EXISTS notification_streams (
         stream TEXT PRIMARY KEY,enabled INTEGER NOT NULL CHECK(enabled IN (0,1)),
         floor_block INTEGER NOT NULL CHECK(floor_block>=0),floor_hash TEXT NOT NULL,
-        generation INTEGER NOT NULL CHECK(generation>=0))''')
-    connection.execute('''CREATE TABLE notification_decisions (
-        stream TEXT NOT NULL,event_key TEXT NOT NULL,kind TEXT NOT NULL,destination TEXT NOT NULL,
-        block INTEGER NOT NULL,generation INTEGER NOT NULL,message_hash TEXT NOT NULL,
-        status TEXT NOT NULL CHECK(status IN ('suppressed','claimed','attempted','delivered','uncertain')),
-        PRIMARY KEY(stream,event_key,kind,destination),FOREIGN KEY(stream) REFERENCES notification_streams(stream))''')
-    connection.execute('''CREATE TABLE notification_blocks (
-        stream TEXT NOT NULL,kind TEXT NOT NULL,destination TEXT NOT NULL,block INTEGER NOT NULL,event_key TEXT NOT NULL,
-        PRIMARY KEY(stream,kind,destination,block),FOREIGN KEY(stream) REFERENCES notification_streams(stream))''')
-    connection.execute("INSERT INTO _migration_meta VALUES ('notification_schema_version','1')")
+        generation INTEGER NOT NULL CHECK(generation>=0))""")
+    connection.execute("INSERT INTO _migration_meta VALUES ('notification_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
+    recovery.prepare(connection)
 
 
 def add_stream(connection, stream, floor_block, floor_hash):
@@ -57,7 +40,7 @@ def add_stream(connection, stream, floor_block, floor_hash):
 
 def state(connection, stream):
     version = connection.execute("SELECT value FROM _migration_meta WHERE key='notification_schema_version'").fetchone()
-    if version is None or version[0] != '1':
+    if version is None or version[0] != '2':
         raise RuntimeError('Notification schema is missing or incompatible')
     row = connection.execute('SELECT * FROM notification_streams WHERE stream=?', (stream,)).fetchone()
     if row is None:
@@ -102,54 +85,29 @@ def _globally_enabled(connection):
     return bool(row and json.loads(row[0]).get('alerts_enabled') is True)
 
 
-def decide(connection, stream, generation, event_key, block, kind, destination, message, *, once_per_block=False):
-    """Call inside the same transaction that stores the associated application data."""
+def eligible(connection, stream, generation, block):
     current = state(connection, stream)
-    if generation != current['generation']:
+    return (current['generation'] == generation and current['enabled']
+            and block > current['floor_block'] and _globally_enabled(connection))
+
+
+def pending(connection, stream, generation, block, destination):
+    if generation != state(connection, stream)['generation']:
         raise RuntimeError('Notification session changed; stop the stale worker')
-    claim = Claim(stream, event_key, kind, destination)
-    if connection.execute('''SELECT 1 FROM notification_decisions
-        WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()).fetchone():
-        return None
-    eligible = bool(current['enabled'] and block > current['floor_block'] and _globally_enabled(connection))
-    if eligible and once_per_block:
-        eligible = bool(connection.execute('''INSERT INTO notification_blocks VALUES (?,?,?,?,?)
-            ON CONFLICT(stream,kind,destination,block) DO NOTHING''',
-            (stream, kind, destination, block, event_key)).rowcount)
-    connection.execute('INSERT INTO notification_decisions VALUES (?,?,?,?,?,?,?,?)',
-        (*claim.key(), block, generation, hashlib.sha256(message.encode()).hexdigest(), 'claimed' if eligible else 'suppressed'))
-    return claim if eligible else None
+    if eligible(connection, stream, generation, block):
+        return Pending(stream, generation, block, destination)
+    return None
 
 
-def dispatch(store, claim, message, send):
-    """Consume a committed claim before calling the transport; never retry a send."""
-    def begin(connection):
-        row = connection.execute('''SELECT * FROM notification_decisions
-            WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()).fetchone()
-        if row is None or row['status'] != 'claimed':
-            return False
-        if row['message_hash'] != hashlib.sha256(message.encode()).hexdigest():
-            raise RuntimeError('Notification content differs from its committed decision')
-        current = state(connection, claim.stream)
-        eligible = (current['enabled'] and row['generation'] == current['generation']
-                    and row['block'] > current['floor_block'] and _globally_enabled(connection))
-        connection.execute('''UPDATE notification_decisions SET status=?
-            WHERE stream=? AND event_key=? AND kind=? AND destination=?''',
-            ('attempted' if eligible else 'suppressed', *claim.key()))
-        return eligible
-    if not store.write(begin):
+def dispatch(store, item, message, send):
+    # Recheck controls after the data commit and immediately before transport.
+    if not store.read(lambda c: eligible(c, item.stream, item.generation, item.block)):
         return False
     try:
-        send(claim.stream, claim.destination, message)
-    except BaseException:
-        # If this update also fails, the durable 'attempted' state still forbids replay.
-        store.write(lambda connection: connection.execute('''UPDATE notification_decisions SET status='uncertain'
-            WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()))
-        logger.error('Notification uncertain: stream=%s kind=%s event=%s',claim.stream,claim.kind,claim.event_key)
-        raise RuntimeError('Notification delivery outcome is uncertain; automatic retry is disabled') from None
-    store.write(lambda connection: connection.execute('''UPDATE notification_decisions SET status='delivered'
-        WHERE stream=? AND event_key=? AND kind=? AND destination=?''', claim.key()))
-    logger.info('Notification delivered: stream=%s kind=%s event=%s',claim.stream,claim.kind,claim.event_key)
+        send(item.stream, item.destination, message)
+    except Exception:
+        logger.warning('Alert delivery failed: stream=%s destination=%s', item.stream, item.destination)
+        return False
     return True
 
 

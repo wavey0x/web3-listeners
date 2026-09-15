@@ -86,6 +86,10 @@ class DaoTests(unittest.TestCase):
         self.generation=0
         self.sent=[]
 
+    def assert_no_history(self):
+        self.assertEqual(self.store.read(lambda c: c.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('notification_decisions','notification_blocks')").fetchone()[0]), 0)
+
     def seed(self,start=10):
         def write(c):
             c.execute('INSERT INTO dao_checkpoint VALUES (?,?,?,?,?,?)',('dao',1,dao.contract_identity(self.chain.contracts),start,start,dao.hex_value(block_hash(start-1))))
@@ -142,7 +146,7 @@ class DaoTests(unittest.TestCase):
         self.assertEqual(len(self.rows('resupply_votes')),1)
         self.assertEqual(len(self.rows('dao_events')),4)
         self.assertEqual(self.rows('resupply_scanner_progress')[0]['last_scanned_block'],12)
-        self.assertEqual({r['status'] for r in self.rows('notification_decisions')},{'suppressed'})
+        self.assert_no_history()
         self.assertEqual(self.sent,[])
         self.assertFalse(self.scan())
 
@@ -173,7 +177,7 @@ class DaoTests(unittest.TestCase):
         self.assertEqual(self.rows('resupply_proposals')[0]['status'],'executed')
         self.assertEqual(len(self.sent),1)
         self.assertIn('Proposal Executed',self.sent[0][2])
-        self.assertEqual(self.rows('notification_decisions')[0]['status'],'delivered')
+        self.assert_no_history()
         self.chain.height=14
         self.scan()
         self.assertEqual(len(self.sent),1)
@@ -207,7 +211,7 @@ class DaoTests(unittest.TestCase):
             raise RuntimeError('failed write')
         with patch.object(dao,'apply_event',side_effect=fail),self.assertRaisesRegex(RuntimeError,'failed write'):
             self.scan()
-        for table in ('resupply_proposals','resupply_votes','dao_events','notification_decisions','resupply_scanner_progress'):
+        for table in ('resupply_proposals','resupply_votes','dao_events','resupply_scanner_progress'):
             self.assertEqual(self.rows(table),[])
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.sent,[])
@@ -329,7 +333,7 @@ class DaoTests(unittest.TestCase):
         self.assertEqual(self.sent,[])
         self.assertTrue(self.rows('dao_poll_state')[0]['reminder_consumed'])
 
-    def test_uncertain_state_alert_is_not_retried_after_restart(self):
+    def test_sending_failure_preserves_state_and_quiet_restart(self):
         self.seed()
         self.activate()
         now=self.chain.get_block(12)['timestamp']
@@ -342,20 +346,19 @@ class DaoTests(unittest.TestCase):
         def timeout(*args):
             self.send(*args)
             raise TimeoutError('uncertain')
-        with self.assertRaisesRegex(RuntimeError,'automatic retry is disabled'):
-            self.poll(send=timeout)
+        self.poll(send=timeout)
         self.generation=notifications.start_session(self.store,'dao',17,dao.hex_value(block_hash(17)))
         self.poll(baseline=True,send=timeout)
         self.poll(send=timeout)
         self.assertEqual(len(self.sent),1)
-        self.assertEqual(self.rows('notification_decisions')[0]['status'],'uncertain')
+        self.assert_no_history()
 
     def test_changed_hash_contract_set_and_missing_checkpoint_stop_indexing(self):
         with self.assertRaisesRegex(RuntimeError,'checkpoint missing'):
             self.scan()
         self.seed()
         self.chain.hash_changes[9]=block_hash(999)
-        with self.assertRaisesRegex(RuntimeError,'checkpoint block changed'):
+        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
             self.scan()
         self.chain.hash_changes.clear()
         self.chain.contracts['0x2222']=self.chain.contract('0x2222')
@@ -374,7 +377,7 @@ class DaoTests(unittest.TestCase):
         self.chain.height=15
         self.chain.timestamps[15]=now+101
         self.scan()
-        with patch.object(notifications,'decide',side_effect=RuntimeError('decision failed')),self.assertRaisesRegex(RuntimeError,'decision failed'):
+        with patch.object(notifications,'pending',side_effect=RuntimeError('decision failed')),self.assertRaisesRegex(RuntimeError,'decision failed'):
             self.poll()
         self.assertFalse(self.rows('resupply_proposals')[0]['ending_soon_alert_sent'])
         self.assertFalse(self.rows('dao_poll_state')[0]['reminder_consumed'])
@@ -392,6 +395,41 @@ class DaoTests(unittest.TestCase):
             rpc.assert_not_called()
 
 
+    def test_reorg_reverses_votes_execution_and_description_before_replay(self):
+        self.seed(); self.activate()
+        self.chain.logs=[event('ProposalCreated',10),event('VoteCast',11)]
+        self.scan(); self.poll(baseline=True)
+        old_votes=self.rows('resupply_votes')
+        self.chain.latest=14
+        self.chain.logs += [event('VoteCast',14,index=0),event('ProposalDescriptionUpdated',14,index=1),event('ProposalExecuted',14,index=2)]
+        self.scan()
+        self.assertEqual(self.rows('resupply_proposals')[0]['status'],'executed')
+        self.assertEqual(self.rows('resupply_proposals')[0]['yes_votes'],4_000_000.)
+        self.chain.hash_changes[14]=block_hash(9999)
+        replacement=event('ProposalCancelled',14); replacement['blockHash']=block_hash(9999)
+        self.chain.logs=self.chain.logs[:2]+[replacement]
+        self.scan()
+        row=self.rows('resupply_proposals')[0]
+        self.assertEqual(row['status'],'open')
+        self.assertEqual(row['yes_votes'],2_000_000.)
+        self.assertEqual(row['description'],'Description')
+        self.assertIsNone(row['execution_time'])
+        self.assertEqual(self.rows('resupply_votes'),old_votes)
+        self.assertEqual(self.rows('dao_poll_checkpoint'),[])
+        self.scan(); self.poll(baseline=True)
+        self.assertEqual(self.rows('resupply_proposals')[0]['status'],'cancelled')
+        self.assertEqual(self.state()['next_block'],15)
+        self.assert_no_history()
+
+    def test_reorg_removes_orphaned_proposal_creation(self):
+        self.seed(); self.activate(); self.scan()
+        self.chain.latest=14; self.chain.logs=[event('ProposalCreated',14)]; self.scan()
+        self.chain.hash_changes[14]=block_hash(9999); self.chain.logs=[]
+        self.scan(); self.scan(); self.poll(baseline=True)
+        self.assertEqual(self.rows('resupply_proposals'),[])
+        self.assertEqual(self.state()['next_block'],15)
+
+
 class LifecycleTests(unittest.TestCase):
     def test_bundle_requires_explicit_valid_worker_selection(self):
         for value in (None,'','dao,dao','unknown','dao,'):
@@ -405,6 +443,15 @@ class LifecycleTests(unittest.TestCase):
         for function in (ybs_listener.main,recreate_tables.recreate_tables,recreate_weight_tracker_tables.recreate_tables):
             with self.subTest(function=function),self.assertRaisesRegex(RuntimeError,'retired'):
                 function()
+
+
+    def test_fatal_worker_failure_stops_the_bundle(self):
+        import threading
+        import recovery
+        stop=threading.Event()
+        def broken(): raise recovery.FatalError('invalid recovery point')
+        resupply.run_worker('dao',broken,stop)
+        self.assertTrue(stop.is_set())
 
 
 if __name__=='__main__':

@@ -79,6 +79,10 @@ class CurveTests(unittest.TestCase):
         self.sent = []
         self.generation = 0
 
+    def assert_no_history(self):
+        self.assertEqual(self.store.read(lambda c: c.execute(
+            "SELECT count(*) FROM sqlite_master WHERE name IN ('notification_decisions','notification_blocks')").fetchone()[0]), 0)
+
     def seed(self,start=10):
         def write(connection):
             connection.execute('INSERT INTO curve_checkpoint VALUES (?,?,?,?,?)',('curve',1,start,start,curve.hex_value(block_hash(start-1))))
@@ -109,7 +113,7 @@ class CurveTests(unittest.TestCase):
         return self.store.read(curve.checkpoint)
 
     def decide(self,key='event',block=10,kind='test',message='message',per_block=False):
-        return self.store.write(lambda c:notifications.decide(c,'curve',self.generation,key,block,kind,'YLOCKERS',message,once_per_block=per_block))
+        return self.store.write(lambda c:notifications.pending(c,'curve',self.generation,block,'YLOCKERS'))
 
     def import_boundary(self,copies=1):
         self.chain.logs=[vote()]
@@ -124,22 +128,20 @@ class CurveTests(unittest.TestCase):
         self.scan()
         self.assertEqual(self.sent,[])
         self.assertEqual(self.count('curve_gauge_votes'),1)
-        statuses=self.store.read(lambda c:[r[0] for r in c.execute('SELECT status FROM notification_decisions')])
-        self.assertEqual(statuses,['suppressed','suppressed'])
+        self.assert_no_history()
         self.assertEqual(self.state()['next_block'],13)
 
-    def test_multiple_future_votes_preserve_one_large_alert_per_block(self):
+    def test_every_eligible_vote_can_alert_without_a_delivery_ledger(self):
         self.seed()
         self.activate()
         self.chain.logs=[vote(index=0),vote(index=1)]
         self.scan()
         self.assertEqual(self.count('curve_gauge_votes'),2)
-        self.assertEqual(len(self.sent),1)
-        self.assertEqual(self.sent[0][0],'YLOCKERS')
-        self.assertEqual(self.count('notification_blocks'),1)
+        self.assertEqual(len(self.sent),2)
+        self.assert_no_history()
         self.scan()
-        self.assertEqual(len(self.sent),1)
-        self.assertIsNone(self.decide('third-vote',kind='large-vote',per_block=True))
+        self.assertEqual(len(self.sent),2)
+
 
     def test_latest_vote_alert_does_not_wait_for_finality_or_repeat(self):
         self.seed()
@@ -180,43 +182,34 @@ class CurveTests(unittest.TestCase):
         with patch.object(curve,'insert_row',side_effect=insert),self.assertRaisesRegex(RuntimeError,'failed insert'):
             self.scan()
         self.assertEqual(self.sent,[])
-        for table in ('curve_gauge_votes','curve_events','notification_decisions','notification_blocks'):
+        for table in ('curve_gauge_votes','curve_events'):
             self.assertEqual(self.count(table),0)
         self.assertEqual(self.state()['next_block'],10)
 
-    def test_failed_attempt_commit_never_sends_or_replays_queue(self):
+    def test_dispatch_needs_no_database_write(self):
         self.seed()
         self.activate()
-        self.chain.logs=[vote()]
-        original=self.store.write
-        def write(callback):
-            if callback.__name__=='begin':
-                raise RuntimeError('attempt commit failed')
-            return original(callback)
-        with patch.object(self.store,'write',side_effect=write),self.assertRaisesRegex(RuntimeError,'attempt commit failed'):
-            self.scan()
-        self.assertEqual(self.sent,[])
-        self.assertEqual(self.state()['next_block'],13)
-        self.scan()
-        self.assertEqual(self.sent,[])
+        item=self.decide()
+        with patch.object(self.store,'write',side_effect=AssertionError('unexpected delivery write')):
+            self.assertTrue(notifications.dispatch(self.store,item,'message',self.send))
+        self.assertEqual(len(self.sent),1)
+        self.assert_no_history()
 
-    def test_uncertain_delivery_has_one_attempt_even_after_restart(self):
+
+    def test_sending_failure_does_not_stop_indexing(self):
         self.seed()
         self.activate()
         self.chain.logs=[vote()]
-        def timeout(stream,destination,message):
-            self.sent.append((destination,message))
+        def timeout(*args):
             raise TimeoutError('uncertain response')
-        with self.assertRaisesRegex(RuntimeError,'automatic retry is disabled'):
-            self.scan(timeout)
-        self.assertEqual(len(self.sent),1)
-        status=self.store.read(lambda c:c.execute('SELECT status FROM notification_decisions').fetchone()[0])
-        self.assertEqual(status,'uncertain')
-        self.generation=notifications.start_session(self.store,'curve',14,curve.hex_value(block_hash(14)))
         self.scan(timeout)
-        claim=notifications.Claim('curve',f'1:{curve.GAUGE_CONTROLLER_ADDRESS.lower()}:{curve.hex_value(block_hash(1010))}:0','large-vote','YLOCKERS')
-        self.assertFalse(notifications.dispatch(self.store,claim,'unused',timeout))
+        self.assertEqual(self.state()['next_block'],13)
+        self.chain.latest=14
+        self.chain.logs.append(vote(block=14))
+        self.scan()
         self.assertEqual(len(self.sent),1)
+        self.assert_no_history()
+
 
     def test_restart_suppresses_outage_then_allows_future_events(self):
         self.seed()
@@ -261,14 +254,16 @@ class CurveTests(unittest.TestCase):
         self.assertFalse(notifications.dispatch(self.store,claim,'message',self.send))
         self.assertEqual(self.sent,[])
 
-    def test_payload_changes_cannot_repurpose_existing_claim(self):
+    def test_duplicate_alerts_are_allowed(self):
         self.seed()
         self.activate()
-        claim=self.decide()
-        self.assertIsNone(self.decide(message='different'))
-        with self.assertRaisesRegex(RuntimeError,'content differs'):
-            notifications.dispatch(self.store,claim,'different',self.send)
-        self.assertEqual(self.sent,[])
+        item=self.decide()
+        self.assertIsNotNone(self.decide())
+        notifications.dispatch(self.store,item,'message',self.send)
+        notifications.dispatch(self.store,item,'message',self.send)
+        self.assertEqual(len(self.sent),2)
+        self.assert_no_history()
+
 
     def test_boundary_preserves_historical_fields_and_fills_missing_vote(self):
         original=self.import_boundary()
@@ -306,7 +301,7 @@ class CurveTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[9]=block_hash(999)
-        with self.assertRaisesRegex(RuntimeError,'checkpoint block changed'):
+        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
             self.scan()
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.sent,[])
@@ -375,6 +370,79 @@ class CurveTests(unittest.TestCase):
                 notifications.send_telegram('curve','YLOCKERS','synthetic')
             self.assertNotIn('synthetic-test-token',str(error.exception))
             self.assertEqual(session.post.call_count,2)
+
+
+    def test_reorg_replays_votes_and_keeps_finalized_rows(self):
+        self.seed(); self.activate()
+        self.chain.logs=[vote(block=10)]
+        self.scan()
+        original=self.store.read(lambda c:dict(c.execute('SELECT * FROM curve_gauge_votes').fetchone()))
+        self.chain.latest=14
+        self.chain.logs.append(vote(block=14))
+        self.scan()
+        self.chain.hash_changes[14]=block_hash(9999)
+        replacement=vote(block=14,gauge='replacement')
+        replacement['blockHash']=block_hash(9999)
+        self.chain.logs=[vote(block=10),replacement]
+        self.scan()  # Atomic rewind to 12.
+        self.assertEqual(self.state()['next_block'],13)
+        self.assertEqual(self.count('curve_gauge_votes'),1)
+        self.scan()
+        rows=self.store.read(lambda c:[dict(r) for r in c.execute('SELECT * FROM curve_gauge_votes ORDER BY id')])
+        self.assertEqual(rows[0],original)
+        self.assertEqual(rows[1]['gauge'],'replacement')
+        self.assertEqual(self.state()['next_block'],15)
+        self.assert_no_history()
+
+    def test_empty_reorg_restarts_from_durable_fallback(self):
+        self.seed(); self.activate(); self.scan()
+        self.chain.latest=14; self.scan()
+        self.chain.hash_changes[14]=block_hash(9999)
+        self.store=Store(self.path,IMPORT_ID)
+        self.scan(); self.scan()
+        self.assertEqual(self.state()['previous_hash'],curve.hex_value(block_hash(9999)))
+        self.assertEqual(self.count('curve_gauge_votes'),0)
+
+    def test_interrupted_rollback_keeps_votes_and_checkpoint_together(self):
+        self.seed(); self.activate(); self.scan()
+        self.chain.latest=14; self.chain.logs=[vote(block=14)]; self.scan()
+        previous=self.state()
+        self.chain.hash_changes[14]=block_hash(9999)
+        self.store.write(lambda c:c.execute("CREATE TRIGGER reject_rewind BEFORE DELETE ON curve_events BEGIN SELECT RAISE(ABORT,'interrupted'); END"))
+        with self.assertRaises(sqlite3.IntegrityError): self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.count('curve_gauge_votes'),1)
+        self.store.write(lambda c:c.execute('DROP TRIGGER reject_rewind'))
+        self.scan()
+        self.assertEqual(self.count('curve_gauge_votes'),0)
+        self.assertEqual(self.state()['next_block'],13)
+
+    def test_recovery_rpc_failure_and_invalid_anchor_never_delete_data(self):
+        self.seed(); self.activate(); self.scan()
+        self.chain.latest=14; self.chain.logs=[vote(block=14)]; self.scan()
+        previous=self.state(); get_block=self.chain.get_block
+        self.chain.hash_changes[14]=block_hash(9999)
+        def unavailable(number):
+            if number==12: raise OSError('RPC unavailable')
+            return get_block(number)
+        with patch.object(self.chain,'get_block',side_effect=unavailable),self.assertRaises(OSError): self.scan()
+        self.assertEqual(self.state(),previous)
+        self.chain.hash_changes[12]=block_hash(8888)
+        with self.assertRaisesRegex(RuntimeError,'Finalized recovery point changed'): self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.count('curve_gauge_votes'),1)
+
+    def test_explicit_upgrade_requires_mute_and_preserves_event_data(self):
+        from scripts.upgrade_optimistic import upgrade
+        self.seed(); self.activate(); self.chain.logs=[vote()]; self.scan()
+        before=self.state()
+        with self.assertRaisesRegex(RuntimeError,'Mute'): upgrade(self.store)
+        self.store.write(lambda c:notifications.mute(c,'curve'))
+        self.store.write(lambda c:c.execute('CREATE TABLE notification_decisions(dummy TEXT)'))
+        upgrade(self.store); upgrade(self.store)
+        self.assertEqual(self.state(),before)
+        self.assertEqual(self.count('curve_gauge_votes'),1)
+        self.assert_no_history()
 
 
 if __name__=='__main__':

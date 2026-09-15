@@ -132,4 +132,4 @@ def main():
 
 
 if __name__ == '__main__':
-    sqlite_worker.cli(sys.modules[__name__])
+    sqlite_worker.recovery.entrypoint(lambda: sqlite_worker.cli(sys.modules[__name__]))

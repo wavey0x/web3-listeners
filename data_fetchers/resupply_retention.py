@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from sqlite_store import Store
 import notifications
+import recovery
 
 logger = logging.getLogger(__name__)
 CONTRACT_ADDRESS = '0xB9415639618e70aBb71A0F4F8bbB2643Bf337892'
@@ -99,13 +100,13 @@ def collect(w3, contract, start, end, *, original_supply=None, include_messages=
             blocks[number] = w3.eth.get_block(number)
         block = blocks[number]
         if hex_value(block['hash']) != hex_value(log['blockHash']):
-            raise RuntimeError('Retention event block changed during collection')
+            raise recovery.ChainChanged('Retention event block changed during collection')
         tx = hex_value(log['transactionHash'])
         if tx not in receipts:
             receipts[tx] = w3.eth.get_transaction_receipt(log['transactionHash'])
         receipt = receipts[tx]
         if hex_value(receipt['blockHash']) != hex_value(log['blockHash']) or hex_value(receipt['transactionHash']) != tx:
-            raise RuntimeError('Retention receipt changed during collection')
+            raise recovery.ChainChanged('Retention receipt changed during collection')
         positions = [i for i, item in enumerate(receipt['logs']) if item['logIndex'] == log['logIndex']
                      and hex_value(item['address']) == hex_value(CONTRACT_ADDRESS)]
         if len(positions) != 1:
@@ -121,7 +122,7 @@ def collect(w3, contract, start, end, *, original_supply=None, include_messages=
             message = message_for(row, original_supply, supplies[number])
         items.append(dict(key=f'1:{CONTRACT_ADDRESS.lower()}:{tx}:{positions[0]}',row=row,message=message))
     if hex_value(w3.eth.get_block(end)['hash']) != end_hash:
-        raise RuntimeError('Retention range changed during collection')
+        raise recovery.ChainChanged('Retention range changed during collection')
     return items, end_hash
 
 
@@ -175,15 +176,25 @@ def scan_once(store, w3, contract, original_supply, generation, send):
     if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
         raise RuntimeError('Retention checkpoint chain does not match RPC')
     start = previous['next_block']
-    if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
-        raise RuntimeError('Retention checkpoint block changed; reconciliation required')
+    saved = recovery.block_reorg(store, w3, STREAM, previous, checkpoint)
+    if saved is not None:
+        def rewind(c):
+            if checkpoint(c) != previous or notifications.state(c, STREAM)['generation'] != generation:
+                raise recovery.ChainChanged('Checkpoint or session advanced concurrently')
+            c.execute('DELETE FROM weight_changes WHERE block>?', (saved['block'],))
+            c.execute('DELETE FROM retention_events WHERE block>?', (saved['block'],))
+            c.execute('UPDATE retention_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',
+                      (saved['position'], saved['block_hash'], STREAM))
+        store.write(rewind)
+        logger.warning('%s rewound to finalized block %s', STREAM, saved['block'])
+        return True
     height = w3.eth.get_block('latest')['number']
     if start > height:
         return False
     end = min(start+CHUNK_SIZE-1,height)
     items, block_hash = collect(w3, contract, start, end, original_supply=original_supply)
     if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
-        raise RuntimeError('Retention checkpoint block changed during collection')
+        raise recovery.ChainChanged('Retention checkpoint block changed during collection')
     def commit(connection):
         if checkpoint(connection) != previous or notifications.state(connection, STREAM)['generation'] != generation:
             raise RuntimeError('Retention checkpoint or scan session advanced concurrently')
@@ -195,8 +206,7 @@ def scan_once(store, w3, contract, original_supply, generation, send):
             if not insert_row(connection,item['row']):
                 continue  # Preserve the existing return on a duplicate transaction/log.
             if item['message'] is not None:
-                claim = notifications.decide(connection,STREAM,generation,item['key'],item['row']['block'],
-                                             'weight-change','RESUPPLY_ALERTS',item['message'])
+                claim = notifications.pending(connection, STREAM, generation, item['row']['block'], 'RESUPPLY_ALERTS')
                 if claim:
                     claims.append((claim,item['message']))
         connection.execute('UPDATE retention_checkpoint SET next_block=?,previous_hash=? WHERE stream=?', (end+1,block_hash,STREAM))
@@ -235,7 +245,7 @@ def run(store,w3,contract,*,once=False):
     latest = w3.eth.get_block('latest')
     generation = notifications.start_session(store,STREAM,latest['number'],hex_value(latest['hash']))
     while True:
-        progressed = scan_once(store,w3,contract,original,generation,notifications.send_telegram)
+        progressed = recovery.attempt(lambda: scan_once(store,w3,contract,original,generation,notifications.send_telegram))
         if once:
             return
         if not progressed:
@@ -280,4 +290,4 @@ def cli():
 
 
 if __name__ == '__main__':
-    cli()
+    recovery.entrypoint(cli)
