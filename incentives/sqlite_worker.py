@@ -1,4 +1,4 @@
-"""Completed incentive periods, exact imported observations, and silent recovery."""
+"""Completed incentive periods and immediate, best-effort reports."""
 
 import argparse
 from datetime import datetime, timezone
@@ -189,56 +189,16 @@ def save_calculation(c, protocol, block, block_hash):
         DO UPDATE SET block=excluded.block,block_hash=excluded.block_hash''', (protocol,block,block_hash))
 
 
-def reconcile(store, w3, adapter, previous, generation):
-    saved = store.read(lambda c: recovery.point(c, adapter.STREAM))
-    if saved is not None:
-        recovery.verify(w3, saved)
-    observed = store.read(lambda c: c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
-                                             (adapter.PROTOCOL,)).fetchone())
-    calculation = dict(observed) if observed is not None else dict(
-        block=previous['previous_block'], block_hash=previous['previous_hash'])
-    valid = (hex_value(w3.eth.get_block(previous['previous_block'])['hash']) == previous['previous_hash']
-             and hex_value(w3.eth.get_block(calculation['block'])['hash']) == calculation['block_hash'])
-    if not valid:
-        recovery.verify(w3, saved)
-        if not previous['initial_period'] <= saved['position'] <= previous['next_period']:
-            raise recovery.FatalError('Incentive recovery point is outside processed periods')
-        def rewind(c):
-            if (checkpoint(c, adapter.PROTOCOL) != previous
-                    or notifications.state(c, adapter.STREAM)['generation'] != generation):
-                raise recovery.ChainChanged('Incentive checkpoint or session advanced during recovery')
-            c.execute('DELETE FROM incentives WHERE protocol=? AND period_start>=?',
-                      (adapter.PROTOCOL, saved['position']))
-            c.execute('DELETE FROM incentive_events WHERE protocol=? AND period_start>=?',
-                      (adapter.PROTOCOL, saved['position']))
-            c.execute('UPDATE incentive_checkpoints SET next_period=?,previous_block=?,previous_hash=? WHERE protocol=?',
-                      (saved['position'], saved['block'], saved['block_hash'], adapter.PROTOCOL))
-            save_calculation(c, adapter.PROTOCOL, saved['block'], saved['block_hash'])
-        store.write(rewind)
-        return True
-    finalized = w3.eth.get_block('finalized')['number']
-    if observed is None and calculation['block'] > finalized:
-        raise recovery.FatalError('Existing incentive baseline must be finalized before migration')
-    if calculation['block'] <= finalized and (saved is None or previous['next_period'] > saved['position']):
-        if (hex_value(w3.eth.get_block(calculation['block'])['hash']) != calculation['block_hash']
-                or hex_value(w3.eth.get_block(previous['previous_block'])['hash']) != previous['previous_hash']):
-            raise recovery.ChainChanged('Incentive chain changed while advancing recovery point')
-        def promote(c):
-            if checkpoint(c, adapter.PROTOCOL) != previous or recovery.point(c, adapter.STREAM) != saved:
-                raise recovery.ChainChanged('Incentive checkpoint advanced concurrently')
-            recovery.save(c, adapter.STREAM, calculation['block'], calculation['block_hash'], previous['next_period'])
-        store.write(promote)
-    elif saved is None:
-        raise recovery.FatalError('Finalized incentive recovery point missing')
-    return False
-
-
 def scan_once(store,w3,adapter,generation,send):
     previous=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))
     if w3.eth.chain_id!=1 or previous['chain_id']!=1:
         raise RuntimeError('Incentive checkpoint chain does not match RPC')
-    if reconcile(store, w3, adapter, previous, generation):
-        return True
+    if hex_value(w3.eth.get_block(previous['previous_block'])['hash']) != previous['previous_hash']:
+        raise recovery.FatalError('Incentive checkpoint changed; reconcile saved data before restarting')
+    calculation = store.read(lambda c: c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
+                                                 (adapter.PROTOCOL,)).fetchone())
+    if calculation is not None and hex_value(w3.eth.get_block(calculation['block'])['hash']) != calculation['block_hash']:
+        raise recovery.FatalError('Incentive calculation block changed; reconcile saved data before restarting')
     head=w3.eth.get_block('latest')
     period=previous['next_period']
     if head['timestamp']<=period+WEEK:
@@ -247,8 +207,6 @@ def scan_once(store,w3,adapter,generation,send):
     imported=store.read(lambda c:[dict(row) for row in c.execute('SELECT * FROM incentives WHERE protocol=? AND period_start=?',
                                                                (adapter.PROTOCOL,period))])
     build_new(adapter,items,imported,period)
-    calculation = store.read(lambda c: c.execute('SELECT * FROM incentive_calculations WHERE protocol=?',
-                                                 (adapter.PROTOCOL,)).fetchone())
     if calculation is not None and hex_value(w3.eth.get_block(calculation['block'])['hash']) != calculation['block_hash']:
         raise recovery.ChainChanged('Previous incentive calculation block changed during collection')
     if (hex_value(w3.eth.get_block(previous['previous_block'])['hash'])!=previous['previous_hash']
@@ -323,9 +281,7 @@ def run(store,w3,adapter,*,once=False):
             return
         if not progressed:
             next_period=store.read(lambda c:checkpoint(c,adapter.PROTOCOL))['next_period']
-            saved=store.read(lambda c: recovery.point(c,adapter.STREAM))
-            pending=saved is None or saved['position']<next_period
-            time.sleep(2 if pending else poll_delay(next_period,time.time(),adapter.POLL_INTERVAL))
+            time.sleep(poll_delay(next_period,time.time(),adapter.POLL_INTERVAL))
 
 
 def main(adapter):

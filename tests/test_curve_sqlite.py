@@ -331,7 +331,7 @@ class CurveTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[9]=block_hash(999)
-        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
+        with self.assertRaisesRegex(RuntimeError,'Curve checkpoint changed'):
             self.scan()
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.sent,[])
@@ -402,65 +402,37 @@ class CurveTests(unittest.TestCase):
             self.assertEqual(session.post.call_count,2)
 
 
-    def test_reorg_replays_votes_and_keeps_finalized_rows(self):
+    def test_changed_processed_head_stops_without_replaying_or_deleting_rows(self):
         self.seed(); self.activate()
         self.chain.logs=[vote(block=10)]
         self.scan()
-        original=self.store.read(lambda c:dict(c.execute('SELECT * FROM curve_gauge_votes').fetchone()))
         self.chain.latest=14
         self.chain.logs.append(vote(block=14))
         self.scan()
-        self.chain.hash_changes[14]=block_hash(9999)
-        replacement=vote(block=14,gauge='replacement')
-        replacement['blockHash']=block_hash(9999)
-        self.chain.logs=[vote(block=10),replacement]
-        self.scan()  # Atomic rewind to 12.
-        self.assertEqual(self.state()['next_block'],13)
-        self.assertEqual(self.count('curve_gauge_votes'),1)
-        self.scan()
+        previous=self.state()
         rows=self.store.read(lambda c:[dict(r) for r in c.execute('SELECT * FROM curve_gauge_votes ORDER BY id')])
-        self.assertEqual(rows[0],original)
-        self.assertEqual(rows[1]['gauge'],'replacement')
-        self.assertEqual(self.state()['next_block'],15)
+        sent=len(self.sent)
+        self.chain.hash_changes[14]=block_hash(9999)
+        with self.assertRaisesRegex(RuntimeError,'Curve checkpoint changed'):
+            self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.store.read(lambda c:[dict(r) for r in c.execute('SELECT * FROM curve_gauge_votes ORDER BY id')]),rows)
+        self.assertEqual(len(self.sent),sent)
         self.assert_no_history()
 
-    def test_empty_reorg_restarts_from_durable_fallback(self):
-        self.seed(); self.activate(); self.scan()
-        self.chain.latest=14; self.scan()
-        self.chain.hash_changes[14]=block_hash(9999)
-        self.store=Store(self.path,IMPORT_ID)
-        self.scan(); self.scan()
-        self.assertEqual(self.state()['previous_hash'],curve.hex_value(block_hash(9999)))
-        self.assertEqual(self.count('curve_gauge_votes'),0)
-
-    def test_interrupted_rollback_keeps_votes_and_checkpoint_together(self):
-        self.seed(); self.activate(); self.scan()
-        self.chain.latest=14; self.chain.logs=[vote(block=14)]; self.scan()
-        previous=self.state()
-        self.chain.hash_changes[14]=block_hash(9999)
-        self.store.write(lambda c:c.execute("CREATE TRIGGER reject_rewind BEFORE DELETE ON curve_events BEGIN SELECT RAISE(ABORT,'interrupted'); END"))
-        with self.assertRaises(sqlite3.IntegrityError): self.scan()
-        self.assertEqual(self.state(),previous)
-        self.assertEqual(self.count('curve_gauge_votes'),1)
-        self.store.write(lambda c:c.execute('DROP TRIGGER reject_rewind'))
-        self.scan()
-        self.assertEqual(self.count('curve_gauge_votes'),0)
-        self.assertEqual(self.state()['next_block'],13)
-
-    def test_recovery_rpc_failure_and_invalid_anchor_never_delete_data(self):
-        self.seed(); self.activate(); self.scan()
-        self.chain.latest=14; self.chain.logs=[vote(block=14)]; self.scan()
-        previous=self.state(); get_block=self.chain.get_block
-        self.chain.hash_changes[14]=block_hash(9999)
-        def unavailable(number):
-            if number==12: raise OSError('RPC unavailable')
+    def test_live_scan_does_not_read_finalized(self):
+        self.seed(); self.activate()
+        self.chain.latest=14
+        self.chain.logs=[vote(block=14)]
+        get_block=self.chain.get_block
+        def no_finalized(number):
+            if number=='finalized':
+                raise AssertionError('live alerts must not read finalized')
             return get_block(number)
-        with patch.object(self.chain,'get_block',side_effect=unavailable),self.assertRaises(OSError): self.scan()
-        self.assertEqual(self.state(),previous)
-        self.chain.hash_changes[12]=block_hash(8888)
-        with self.assertRaisesRegex(RuntimeError,'Finalized recovery point changed'): self.scan()
-        self.assertEqual(self.state(),previous)
-        self.assertEqual(self.count('curve_gauge_votes'),1)
+        with patch.object(self.chain,'get_block',side_effect=no_finalized):
+            self.scan()
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(self.state()['next_block'],15)
 
     def test_explicit_upgrade_requires_mute_and_preserves_event_data(self):
         from scripts.upgrade_optimistic import upgrade
@@ -475,12 +447,14 @@ class CurveTests(unittest.TestCase):
         self.assert_no_history()
 
 
-    def test_invalid_fallback_position_cannot_skip_records(self):
-        self.seed(); self.activate(); self.scan()
-        self.store.write(lambda c:c.execute("UPDATE recovery_points SET position=99999 WHERE stream='curve'"))
-        previous=self.state()
-        with self.assertRaisesRegex(RuntimeError,'outside the processed import range'): self.scan()
-        self.assertEqual(self.state(),previous)
+    def test_legacy_recovery_table_is_ignored(self):
+        self.seed(); self.activate()
+        self.store.write(lambda c:c.execute('CREATE TABLE recovery_points (stream TEXT PRIMARY KEY, block INTEGER, block_hash TEXT, position INTEGER)'))
+        self.store.write(lambda c:c.execute("INSERT INTO recovery_points VALUES ('curve',1,'bad',99999)"))
+        self.chain.logs=[vote()]
+        self.scan()
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(self.state()['next_block'],13)
 
 
 if __name__=='__main__':

@@ -176,18 +176,8 @@ def scan_once(store, w3, contract, original_supply, generation, send):
     if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
         raise RuntimeError('Retention checkpoint chain does not match RPC')
     start = previous['next_block']
-    saved = recovery.block_reorg(store, w3, STREAM, previous, checkpoint)
-    if saved is not None:
-        def rewind(c):
-            if checkpoint(c) != previous or notifications.state(c, STREAM)['generation'] != generation:
-                raise recovery.ChainChanged('Checkpoint or session advanced concurrently')
-            c.execute('DELETE FROM weight_changes WHERE block>?', (saved['block'],))
-            c.execute('DELETE FROM retention_events WHERE block>?', (saved['block'],))
-            c.execute('UPDATE retention_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',
-                      (saved['position'], saved['block_hash'], STREAM))
-        store.write(rewind)
-        logger.warning('%s rewound to finalized block %s', STREAM, saved['block'])
-        return True
+    if hex_value(w3.eth.get_block(start-1)['hash']) != previous['previous_hash']:
+        raise recovery.FatalError('Retention checkpoint changed; reconcile saved data before restarting')
     height = w3.eth.get_block('latest')['number']
     if start > height:
         return False

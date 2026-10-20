@@ -13,7 +13,7 @@ installed code, runtime, database and configuration; restored workers stay held.
   Batch voting can produce many qualifying events in one transaction. This limit
   is local to the scanned batch; it needs no delivery history or schema change.
 - RSUP and YieldBasis reports run as soon as a completed week and its calculation
-  block exist. They retain that block's hash and recheck it until finalized.
+  block exist. They retain that block's hash to detect stale calculations.
 - Liquid-locker harvests index finalized blocks and have no notification path.
   The duplicate YBS listener and destructive recreate scripts remain retired.
 - Alerts send after the data commit, with no delivery ledger, queue or exactly-once
@@ -21,24 +21,22 @@ installed code, runtime, database and configuration; restored workers stay held.
   permits and silent restart/catch-up remain in place. DAO retains only the current
   condition/reminder state needed to avoid announcing the same condition every poll.
 
-## Reorganisation recovery
+## Chain changes
 
-Each alert stream keeps one finalized fallback within its already processed data.
-Finality never delays alerts. On a changed head checkpoint, the worker verifies
-that fallback, rolls back its unfinalized data and progress together, then replays.
-Temporary RPC errors and changing collections retry without partial data writes.
+Live alert scans do not query `finalized` or maintain recovery points. They check
+the saved checkpoint and validate logs, receipts and block hashes collected in one
+scan. Temporary RPC errors and changing collections retry without partial writes.
+If a processed block or an incentive calculation block changes, the affected worker
+stops for explicit data reconciliation. It does not automatically rewind or replay.
+Alerts already sent for orphaned blocks cannot be withdrawn; replacement events
+may be missed until the checkpoint and affected rows are repaired. Event identity
+remains for data correctness, not notification deduplication.
 
-Curve and retention delete newer event rows. DAO also reconstructs affected
-proposals from canonical events, preserving older vote rows, and establishes a
-quiet polling baseline after catch-up. Incentives roll back whole affected periods
-per protocol, including changes to the calculation block; finalized/imported
-observations are not repriced. Event identity remains for data correctness, not
-notification deduplication.
-
-A changed finalized fallback or invalid application state requires operator repair.
 The Resupply bundle fails visibly if any worker cannot continue. Configure
 `RestartPreventExitStatus=78` alongside `Restart=on-failure` on notification units.
 Check actual checkpoints/logs, not just whether the parent process is running.
+Databases upgraded by the earlier release may retain an unused `recovery_points`
+table. No live schema change or table cleanup is required for this release.
 
 ## Runtime and upgrade
 
@@ -49,17 +47,17 @@ select `YEARN_RESUPPLY_WORKERS=rsup-incentives,yb-incentives,dao,retention`.
 Existing credentials, routing and permissions remain configuration inputs.
 
 The optimistic upgrade changes notification schema 1 to 2 and removes the old
-`notification_decisions` and `notification_blocks` tables:
+`notification_decisions` and `notification_blocks` tables. Already upgraded schema 2
+databases need no migration for removal of automatic recovery:
 
 1. Stop Curve and the Resupply bundle. Take a consistent database backup and retain
    the previous release/unit configuration. Remove local notification permits and
    mute streams with the old release's native commands.
 2. Install the new release and run `python scripts/upgrade_optimistic.py` with the
    service environment. It refuses enabled streams and is safe to repeat while muted.
-3. If a legacy checkpoint already disagrees with chain history, reconcile it before
+3. If a checkpoint already disagrees with chain history, reconcile it before
    startup. Never overwrite its hash to skip a replacement block. Verify the exact
-   old checkpoint and affected data, then rewind to a verified common parent in one
-   transaction. Recovery points initialize from valid processed state.
+   checkpoint and affected data, then repair rows and progress together.
 4. Catch up silently with the native `--once` commands, validate records and DAO
    polling state, then enable future alerts with the native activation commands.
    Restart the reviewed workers with exit-78 handling and check each one's progress.
@@ -82,7 +80,7 @@ including legacy duplicates/null log indexes. Normal startup does not create an
 empty database or guess an import boundary. Shared import identity, WAL and full
 synchronous commits remain required.
 
-Run `python -m unittest discover -s tests -v`. Coverage includes reorg rollback,
-interrupted writes, RPC/send failure, proposal state reversal, calculation-block
-replacement, stream isolation, old observations, quiet recovery and local permits.
+Run `python -m unittest discover -s tests -v`. Coverage includes immediate alerts
+without finalized RPC reads, atomic writes, RPC/send failure, visible checkpoint
+and calculation-block mismatch, stream isolation, old observations and local permits.
 Rehearse real-data upgrades on a private database copy with sending disabled.

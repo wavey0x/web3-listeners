@@ -8,7 +8,6 @@ from pathlib import Path
 import re
 import stat
 
-import recovery
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +30,6 @@ def prepare(connection):
         floor_block INTEGER NOT NULL CHECK(floor_block>=0),floor_hash TEXT NOT NULL,
         generation INTEGER NOT NULL CHECK(generation>=0))""")
     connection.execute("INSERT INTO _migration_meta VALUES ('notification_schema_version','2') ON CONFLICT(key) DO UPDATE SET value='2'")
-    recovery.prepare(connection)
 
 
 def add_stream(connection, stream, floor_block, floor_hash):
