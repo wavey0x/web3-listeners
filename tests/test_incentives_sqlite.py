@@ -274,7 +274,7 @@ class IncentiveTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[999]=block_hash(555)
-        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
+        with self.assertRaisesRegex(RuntimeError,'Incentive checkpoint changed'):
             self.scan()
         self.chain.hash_changes.clear()
         notifications.start_session(self.store,self.adapter.STREAM,1014,worker.hex_value(block_hash(1014)))
@@ -310,37 +310,52 @@ class IncentiveTests(unittest.TestCase):
         self.assertEqual(self.store.read(corrections.read_rows),after)
         self.assert_no_history()
 
-    def test_calculation_block_reorg_recomputes_period_before_finality(self):
+    def test_changed_calculation_block_stops_without_repricing(self):
         self.seed(); self.activate()
         self.chain.height=1005; self.chain.latest=1011
         self.chain.logs=[transfer(self.adapter.TOKEN)]
         self.scan()
         self.assertEqual(self.state()['previous_block'],1009)
         self.assertEqual(self.rows('incentive_calculations')[0]['block'],1011)
+        previous=self.state()
+        rows=self.rows('incentives')
+        sent=len(self.sent)
         self.chain.hash_changes[1011]=block_hash(9999)  # End-block hash is unchanged.
-        self.scan()
-        self.assertEqual(self.state()['next_period'],PERIOD)
-        self.assertEqual(self.rows('incentives'),[])
-        self.scan()
-        self.assertEqual(self.adapter.build_record.call_count,2)
-        self.assertEqual(len(self.rows('incentives')),1)
-        self.assertEqual(len(self.sent),2)
+        with self.assertRaisesRegex(RuntimeError,'Incentive calculation block changed'):
+            self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.rows('incentives'),rows)
+        self.assertEqual(len(self.sent),sent)
         self.assert_no_history()
 
-    def test_finalized_period_and_other_protocol_survive_next_period_reorg(self):
+    def test_changed_next_period_calculation_leaves_other_protocol_untouched(self):
         other=self.chain.adapter('yieldbasis')
         self.seed(); self.seed(other); self.activate()
         self.chain.logs=[transfer(self.adapter.TOKEN),transfer(other.TOKEN)]
         self.scan()
         worker.scan_once(self.store,self.chain,other,0,self.send)
-        original=self.rows('incentives')
-        self.scan()  # Finalize the processed first week.
         self.chain.latest=1021
         self.chain.logs.append(transfer(self.adapter.TOKEN,block=1015))
         self.scan()
+        previous=self.state()
+        original=self.rows('incentives')
         self.chain.hash_changes[1021]=block_hash(9999)
-        self.scan()
+        with self.assertRaisesRegex(RuntimeError,'Incentive calculation block changed'):
+            self.scan()
         self.assertEqual(self.rows('incentives'),original)
+        self.assertEqual(self.state(),previous)
+
+    def test_live_report_does_not_read_finalized(self):
+        self.seed(); self.activate()
+        self.chain.logs=[transfer(self.adapter.TOKEN)]
+        get_block=self.chain.get_block
+        def no_finalized(number):
+            if number=='finalized':
+                raise AssertionError('live reports must not read finalized')
+            return get_block(number)
+        with patch.object(self.chain,'get_block',side_effect=no_finalized):
+            self.scan()
+        self.assertEqual(len(self.sent),1)
         self.assertEqual(self.state()['next_period'],PERIOD+WEEK)
 
 

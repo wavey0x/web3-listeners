@@ -209,7 +209,7 @@ class RetentionTests(unittest.TestCase):
             self.scan()
         self.chain.fail=False
         self.chain.hash_changes[9]=block_hash(99)
-        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
+        with self.assertRaisesRegex(RuntimeError,'Retention checkpoint changed'):
             self.scan()
         self.assertEqual(self.state()['next_block'],10)
         self.assertEqual(self.rows('retention_events'),[])
@@ -266,19 +266,33 @@ class RetentionTests(unittest.TestCase):
         self.assertEqual(self.state()['next_block'],5010)
 
 
-    def test_reorg_replaces_only_unfinalized_weights(self):
+    def test_changed_processed_head_stops_without_deleting_weights(self):
         self.seed(); self.activate(); self.chain.logs=[weight(block=10)]; self.scan()
-        original=self.rows('weight_changes')[0]
         self.chain.latest=14; self.chain.logs.append(weight(block=14,new=1)); self.scan()
-        self.chain.hash_changes[14]=block_hash(9999)
-        replacement=weight(block=14,new=2); replacement['blockHash']=block_hash(9999)
-        self.chain.logs=[weight(block=10),replacement]
-        self.scan(); self.scan()
+        previous=self.state()
         rows=self.rows('weight_changes')
-        self.assertEqual(rows[0],original)
-        self.assertEqual(rows[1]['new_weight'],'2')
-        self.assertEqual(self.state()['next_block'],15)
+        sent=len(self.sent)
+        self.chain.hash_changes[14]=block_hash(9999)
+        with self.assertRaisesRegex(RuntimeError,'Retention checkpoint changed'):
+            self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.rows('weight_changes'),rows)
+        self.assertEqual(len(self.sent),sent)
         self.assert_no_history()
+
+    def test_live_scan_does_not_read_finalized(self):
+        self.seed(); self.activate()
+        self.chain.latest=14
+        self.chain.logs=[weight(block=14)]
+        get_block=self.chain.get_block
+        def no_finalized(number):
+            if number=='finalized':
+                raise AssertionError('live alerts must not read finalized')
+            return get_block(number)
+        with patch.object(self.chain,'get_block',side_effect=no_finalized):
+            self.scan()
+        self.assertEqual(len(self.sent),1)
+        self.assertEqual(self.state()['next_block'],15)
 
 
 if __name__ == '__main__':

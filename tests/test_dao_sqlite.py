@@ -358,7 +358,7 @@ class DaoTests(unittest.TestCase):
             self.scan()
         self.seed()
         self.chain.hash_changes[9]=block_hash(999)
-        with self.assertRaisesRegex(RuntimeError,'[Rr]ecovery point'):
+        with self.assertRaisesRegex(RuntimeError,'DAO checkpoint changed'):
             self.scan()
         self.chain.hash_changes.clear()
         self.chain.contracts['0x2222']=self.chain.contract('0x2222')
@@ -395,38 +395,38 @@ class DaoTests(unittest.TestCase):
             rpc.assert_not_called()
 
 
-    def test_reorg_reverses_votes_execution_and_description_before_replay(self):
+    def test_changed_processed_head_stops_without_rewriting_proposals(self):
         self.seed(); self.activate()
         self.chain.logs=[event('ProposalCreated',10),event('VoteCast',11)]
         self.scan(); self.poll(baseline=True)
-        old_votes=self.rows('resupply_votes')
         self.chain.latest=14
         self.chain.logs += [event('VoteCast',14,index=0),event('ProposalDescriptionUpdated',14,index=1),event('ProposalExecuted',14,index=2)]
         self.scan()
-        self.assertEqual(self.rows('resupply_proposals')[0]['status'],'executed')
-        self.assertEqual(self.rows('resupply_proposals')[0]['yes_votes'],4_000_000.)
+        previous=self.state()
+        proposals=self.rows('resupply_proposals')
+        votes=self.rows('resupply_votes')
+        sent=len(self.sent)
         self.chain.hash_changes[14]=block_hash(9999)
-        replacement=event('ProposalCancelled',14); replacement['blockHash']=block_hash(9999)
-        self.chain.logs=self.chain.logs[:2]+[replacement]
-        self.scan()
-        row=self.rows('resupply_proposals')[0]
-        self.assertEqual(row['status'],'open')
-        self.assertEqual(row['yes_votes'],2_000_000.)
-        self.assertEqual(row['description'],'Description')
-        self.assertIsNone(row['execution_time'])
-        self.assertEqual(self.rows('resupply_votes'),old_votes)
-        self.assertEqual(self.rows('dao_poll_checkpoint'),[])
-        self.scan(); self.poll(baseline=True)
-        self.assertEqual(self.rows('resupply_proposals')[0]['status'],'cancelled')
-        self.assertEqual(self.state()['next_block'],15)
+        with self.assertRaisesRegex(RuntimeError,'DAO checkpoint changed'):
+            self.scan()
+        self.assertEqual(self.state(),previous)
+        self.assertEqual(self.rows('resupply_proposals'),proposals)
+        self.assertEqual(self.rows('resupply_votes'),votes)
+        self.assertEqual(len(self.sent),sent)
         self.assert_no_history()
 
-    def test_reorg_removes_orphaned_proposal_creation(self):
-        self.seed(); self.activate(); self.scan()
-        self.chain.latest=14; self.chain.logs=[event('ProposalCreated',14)]; self.scan()
-        self.chain.hash_changes[14]=block_hash(9999); self.chain.logs=[]
-        self.scan(); self.scan(); self.poll(baseline=True)
-        self.assertEqual(self.rows('resupply_proposals'),[])
+    def test_live_scan_does_not_read_finalized(self):
+        self.seed(); self.activate()
+        self.chain.latest=14
+        self.chain.logs=[event('ProposalCreated',14)]
+        get_block=self.chain.get_block
+        def no_finalized(number):
+            if number=='finalized':
+                raise AssertionError('live alerts must not read finalized')
+            return get_block(number)
+        with patch.object(self.chain,'get_block',side_effect=no_finalized):
+            self.scan()
+        self.assertEqual(len(self.sent),1)
         self.assertEqual(self.state()['next_block'],15)
 
 
@@ -449,7 +449,7 @@ class LifecycleTests(unittest.TestCase):
         import threading
         import recovery
         stop=threading.Event()
-        def broken(): raise recovery.FatalError('invalid recovery point')
+        def broken(): raise recovery.FatalError('invalid checkpoint')
         resupply.run_worker('dao',broken,stop)
         self.assertTrue(stop.is_set())
 

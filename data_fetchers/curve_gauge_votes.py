@@ -1,4 +1,4 @@
-"""Curve vote indexing with durable progress and suppressed recovery notifications."""
+"""Curve vote indexing with immediate, best-effort alerts."""
 
 import argparse
 from datetime import datetime, timezone
@@ -204,18 +204,8 @@ def scan_once(store, w3, controller, ve, gauges, generation, send):
     if previous['chain_id'] != 1 or w3.eth.chain_id != 1:
         raise RuntimeError('Curve checkpoint chain does not match RPC')
     start = previous['next_block']
-    saved = recovery.block_reorg(store, w3, STREAM, previous, checkpoint)
-    if saved is not None:
-        def rewind(c):
-            if checkpoint(c) != previous or notifications.state(c, STREAM)['generation'] != generation:
-                raise recovery.ChainChanged('Checkpoint or session advanced concurrently')
-            c.execute('DELETE FROM curve_gauge_votes WHERE block>?', (saved['block'],))
-            c.execute('DELETE FROM curve_events WHERE block>?', (saved['block'],))
-            c.execute('UPDATE curve_checkpoint SET next_block=?,previous_hash=? WHERE stream=?',
-                      (saved['position'], saved['block_hash'], STREAM))
-        store.write(rewind)
-        logger.warning('%s rewound to finalized block %s', STREAM, saved['block'])
-        return True
+    if hex_value(w3.eth.get_block(start - 1)['hash']) != previous['previous_hash']:
+        raise recovery.FatalError('Curve checkpoint changed; reconcile saved data before restarting')
     height = w3.eth.get_block('latest')['number']
     if start > height:
         return
